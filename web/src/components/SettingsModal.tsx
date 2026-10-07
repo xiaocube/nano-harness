@@ -39,13 +39,16 @@ export default function SettingsModal({
   const [section, setSection] = useState<Section>('general');
   const [cfg, setCfg] = useState<HarnessConfig | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; message: string }>>({});
+  /** 设置都是"改完即生效"，这个标记只用来给用户一个"已保存"的确认 */
   const [saved, setSaved] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  /** 最大步数的输入草稿：让用户能先把框清空再输入，而不是每敲一下就夹取+落盘 */
+  const [stepsDraft, setStepsDraft] = useState<string | null>(null);
   /** 正在编辑的提供商（null=列表态；'new'=新增；其他=id 编辑） */
   const [editing, setEditing] = useState<ModelProvider | 'new' | null>(null);
 
   useEffect(() => {
-    void api.getConfig().then(setCfg);
+    void api.getConfig().then(setCfg).catch((err: Error) => setNotice(`读取配置失败：${err.message}`));
   }, []);
 
   useEffect(() => {
@@ -54,12 +57,19 @@ export default function SettingsModal({
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  // 切分节时清掉上一节的提示，避免"模型的提示出现在预设页"这种串台
+  useEffect(() => { setNotice(null); }, [section]);
+
   if (!cfg) return null;
   const update = (patch: Partial<HarnessConfig>) => setCfg({ ...cfg, ...patch });
-  const activeProvider = (cfg.providers ?? []).find((p) => p.id === cfg.activeProviderId);
 
-  const save = async () => {
-    await api.setConfig(cfg);
+  /**
+   * 改完即持久化。历史 bug：权限模式/最大步数只改了本地 state，
+   * 而"保存"按钮从来没被渲染过——用户以为改了，重启后全部还原。
+   */
+  const persist = async (patch: Partial<HarnessConfig>) => {
+    update(patch);
+    await api.setConfig(patch);
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
   };
@@ -76,7 +86,8 @@ export default function SettingsModal({
         <div className="settings-head">
           <h2>设置</h2>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <button className="btn" onClick={() => void api.revealConfigFile()}>
+            {saved && <span className="save-hint" role="status"><CheckIcon size={12} /> 已保存</span>}
+            <button className="btn" onClick={() => { void api.revealConfigFile().catch((err: Error) => setNotice(`打开配置文件失败：${err.message}`)); }}>
               <FileIcon size={13} /> 打开配置文件
             </button>
             <button className="icon-btn" onClick={onClose} aria-label="关闭设置"><XIcon size={14} /></button>
@@ -131,8 +142,9 @@ export default function SettingsModal({
                   <select
                     className="input s-control"
                     value={cfg.yolo ? 'yolo' : 'ask'}
-                    onChange={(e) => update({ yolo: e.target.value === 'yolo' })}
+                    onChange={(e) => void persist({ yolo: e.target.value === 'yolo' })}
                     style={{ width: 180 }}
+                    aria-label="权限模式"
                   >
                     <option value="ask">每次确认（推荐）</option>
                     <option value="yolo">YOLO 自动放行</option>
@@ -149,9 +161,16 @@ export default function SettingsModal({
                     type="number"
                     min={1}
                     max={100}
-                    value={cfg.maxSteps}
-                    onChange={(e) => update({ maxSteps: Number(e.target.value) || 25 })}
+                    value={stepsDraft ?? String(cfg.maxSteps)}
+                    onChange={(e) => setStepsDraft(e.target.value)}
+                    onBlur={() => {
+                      const n = Math.min(100, Math.max(1, Number(stepsDraft) || 25));
+                      setStepsDraft(null);
+                      if (n !== cfg.maxSteps) void persist({ maxSteps: n });
+                    }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
                     style={{ width: 110 }}
+                    aria-label="最大步数"
                   />
                 </div>
               </>
@@ -255,6 +274,8 @@ export default function SettingsModal({
                           update({ activePreset: p.key });
                           const res = await api.setPreset(p.key);
                           setNotice(res.message);
+                          setSaved(true);
+                          setTimeout(() => setSaved(false), 1500);
                         }}
                       >
                         <div className="preset-card-head">

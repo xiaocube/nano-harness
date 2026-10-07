@@ -23,7 +23,12 @@ type AskFn = (question: string) => Promise<string>;
 let askQuestion: AskFn = async (question) => {
   const rl = createInterface({ input: stdin, output: stdout });
   try {
-    return await rl.question(question);
+    // stdin 已关闭/EOF 时 question() 永远不 resolve（cron、CI、`nh "..." < /dev/null`），
+    // 必须并一个 close 竞速，否则进程卡死在第一个危险操作上。
+    return await Promise.race([
+      rl.question(question),
+      new Promise<string>((resolve) => rl.once('close', () => resolve(''))),
+    ]);
   } finally {
     rl.close(); // 用完必须关掉，否则进程挂起不退出
   }
@@ -81,6 +86,13 @@ export async function confirm(req: PermissionRequest, yolo: boolean): Promise<bo
     console.log(C.yellow(`  │ ${line}`));
   }
   console.log(C.yellow('  └────────────────────────────────────────'));
+
+  // 非交互环境（管道/重定向/cron）根本没有"人"可以回答：直接按拒绝处理，
+  // 让脚本能失败退出，而不是无声地挂住。要无人值守就用 --yolo 明确承担风险。
+  if (!stdin.isTTY) {
+    console.log(C.yellow('  ⚠ 当前不是交互终端，无人可确认 → 按拒绝处理（需要自动放行请用 --yolo）'));
+    return false;
+  }
 
   // 默认拒绝：直接回车或输入其他任何内容都不放行。
   // "默认拒绝"是安全系统的第一原则——误拒绝的代价是重试一次，误放行的代价可能是数据。

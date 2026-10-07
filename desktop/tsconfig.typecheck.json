@@ -1,0 +1,7 @@
+{
+  "//": "只做类型检查，不产出文件：preload.ts 由 esbuild 打包成 preload.cjs（见 build:preload），",
+  "//2": "所以不放进构建用的 tsconfig，但必须参与类型检查（v0.3.1 修复时发现它从未被检查过）。",
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["main.ts", "agent-bridge.ts", "preload.ts"]
+}

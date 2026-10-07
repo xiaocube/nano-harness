@@ -7,8 +7,9 @@
  * "添加插件"弹窗提供两条路径：Finder 打开插件目录手动放置 / 提 PR 上架官方索引。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, type InstalledPlugin, type MarketplaceEntry } from '../api.js';
+import { useDismiss } from '../useDismiss.js';
 import { PuzzleIcon, DownloadIcon, CheckIcon, TrashIcon, RefreshIcon, PlusIcon, FolderIcon, XIcon } from './icons.js';
 
 /** 按插件名稳定选一个颜色，让每行图标像 dsh 一样各有身份 */
@@ -40,9 +41,13 @@ export default function PluginsPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
+  /** "添加插件"弹窗：点遮罩空白处 / Esc 都能关 */
+  const addSheetRef = useRef<HTMLDivElement>(null);
+  useDismiss(showAdd, addSheetRef, () => setShowAdd(false));
 
   const refresh = async () => {
-    const [index, installed] = await Promise.all([api.listMarketplace(), api.listInstalledPlugins()]);
+    try {
+      const [index, installed] = await Promise.all([api.listMarketplace(), api.listInstalledPlugins()]);
     const byName = new Map(installed.map((p) => [p.manifest.name, p]));
     const official: Row[] = index.plugins.map((e: MarketplaceEntry) => {
       const inst = byName.get(e.name);
@@ -62,29 +67,59 @@ export default function PluginsPage() {
         installed: true, enabled: p.enabled, toolNames: p.toolNames,
         loadError: p.loadError, official: false,
       }));
-    setRows([...official, ...local]);
+      setRows([...official, ...local]);
+    } catch (err) {
+      setNotice(`读取插件失败：${(err as Error).message}`);
+      setRows([]);
+    }
   };
   useEffect(() => { void refresh(); }, []);
 
   const install = async (name: string) => {
     setBusy(name); setNotice(null);
-    const res = await api.installPlugin(name);
-    setBusy(null); setNotice(res.message);
-    await refresh();
+    try {
+      const res = await api.installPlugin(name);
+      setNotice(res.message);
+    } catch (err) {
+      setNotice(`安装失败：${(err as Error).message}`);
+    } finally {
+      setBusy(null);   // 必须放 finally：否则异常时按钮永远停在"安装中…"
+      await refresh();
+    }
   };
 
   const toggle = async (name: string, enabled: boolean) => {
     // 乐观更新：开关先动，结果提示随后
     setRows((xs) => xs.map((r) => (r.name === name ? { ...r, enabled } : r)));
-    const res = await api.togglePlugin(name, enabled);
-    setNotice(res.message);
-    if (!res.ok) await refresh();
+    try {
+      const res = await api.togglePlugin(name, enabled);
+      setNotice(res.message);
+      if (!res.ok) await refresh();
+    } catch (err) {
+      setNotice(`切换失败：${(err as Error).message}`);
+      await refresh();
+    }
   };
 
   const uninstall = async (name: string) => {
-    const res = await api.uninstallPlugin(name);
-    setNotice(res.message);
-    await refresh();
+    try {
+      const res = await api.uninstallPlugin(name);
+      setNotice(res.message);
+    } catch (err) {
+      setNotice(`卸载失败：${(err as Error).message}`);
+    } finally {
+      await refresh();
+    }
+  };
+
+  /** 在访达里打开插件目录（失败要说出来，不能像没反应） */
+  const revealPlugins = async () => {
+    try {
+      const res = await api.revealPluginsDir();
+      if (!res.ok) setNotice('打开插件目录失败');
+    } catch (err) {
+      setNotice(`打开插件目录失败：${(err as Error).message}`);
+    }
   };
 
   const officialRows = rows.filter((r) => r.official);
@@ -118,7 +153,7 @@ export default function PluginsPage() {
 
       {showAdd && (
         <div className="overlay" role="dialog" aria-modal="true" aria-label="添加插件">
-          <div className="sheet">
+          <div className="sheet" ref={addSheetRef}>
             <h3><PlusIcon size={16} /> 添加插件</h3>
             <p className="p-desc" style={{ marginBottom: 12 }}>
               两种方式把插件装进来：
@@ -129,7 +164,7 @@ export default function PluginsPage() {
             </div>
             <div className="actions">
               <button className="btn" onClick={() => setShowAdd(false)}><XIcon size={13} /> 关闭</button>
-              <button className="btn btn-accent" onClick={() => { void api.revealPluginsDir(); }}>
+              <button className="btn btn-accent" onClick={() => { void revealPlugins(); }}>
                 <FolderIcon size={13} /> 打开插件目录
               </button>
             </div>

@@ -20,11 +20,16 @@ function subscribe(channel: string, callback: (payload: unknown) => void): () =>
 
 contextBridge.exposeInMainWorld('nanoharness', {
   /* ---------- 对话 ---------- */
-  send: (task: string) => ipcRenderer.invoke('agent:send', task),
+  // 注意：必须把 opts（工作区 / 预设）原样透传，否则 composer 里选的
+  // 工作区/预设会被静默丢弃——v0.3.0 的"换文件夹不生效"就是这个原因。
+  send: (task: string, opts?: { workspace?: string; preset?: string }) =>
+    ipcRenderer.invoke('agent:send', task, opts),
   newChat: () => ipcRenderer.invoke('chat:new'),
   currentMessages: () => ipcRenderer.invoke('chat:current'),
   replyPermission: (id: number, allowed: boolean) =>
     ipcRenderer.send('agent:permission:reply', { id, allowed }),
+  /** 界面挂载时取回"还没被回答"的权限请求（切页面回来 / Cmd+R 之后仍能弹出来） */
+  pendingPermissions: () => ipcRenderer.invoke('permission:pending'),
   onAgentEvent: (callback: (payload: unknown) => void) => subscribe('agent:event', callback),
 
   /* ---------- 会话 ---------- */
@@ -46,7 +51,17 @@ contextBridge.exposeInMainWorld('nanoharness', {
 
   /* ---------- 预设与工作区 ---------- */
   setPreset: (preset: string) => ipcRenderer.invoke('preset:set', preset),
+  workspaceInfo: () => ipcRenderer.invoke('workspace:get'),
   chooseWorkspace: () => ipcRenderer.invoke('workspace:choose'),
+  setWorkspace: (path: string) => ipcRenderer.invoke('workspace:set', path),
+  revealWorkspace: () => ipcRenderer.invoke('workspace:reveal'),
+  onWorkspaceChanged: (callback: (payload: unknown) => void) => subscribe('workspace:changed', callback),
+
+  /* ---------- 成果预览（文件浏览 + 客户端内渲染） ---------- */
+  listFiles: (rel?: string) => ipcRenderer.invoke('file:list', rel),
+  previewFile: (rel: string) => ipcRenderer.invoke('file:preview', rel),
+  revealFile: (rel: string) => ipcRenderer.invoke('file:reveal', rel),
+  openFileExternal: (rel: string) => ipcRenderer.invoke('file:openExternal', rel),
 
   /* ---------- 主题 ---------- */
   getTheme: () => ipcRenderer.invoke('theme:get'),

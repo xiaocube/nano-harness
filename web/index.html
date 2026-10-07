@@ -3,9 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- frame-src nh-file: 只为"成果预览"服务：HTML 文件通过自定义协议交给 sandbox iframe 渲染。
+         用自定义协议而不是 data:，是因为 data: 文档会继承本页 CSP，被预览页面里的内联 <script> 会被拦掉。 -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src nh-file:;"
     />
     <title>nano-harness</title>
   </head>

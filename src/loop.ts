@@ -96,8 +96,8 @@ export type AgentEvent =
   | { type: 'usage'; tokens?: number; model: string }
   /** 历史被压缩成摘要 */
   | { type: 'compacted' }
-  /** 模型发起一次工具调用 */
-  | { type: 'tool_call'; step: number; maxSteps: number; name: string; summary: string }
+  /** 模型发起一次工具调用（target = 被操作的文件/目录，UI 据此提供"预览"入口） */
+  | { type: 'tool_call'; step: number; maxSteps: number; name: string; summary: string; target?: string }
   /** 工具执行完成（preview 是给用户看的截断预览） */
   | { type: 'tool_result'; name: string; preview: string }
   /** 用户拒绝了某次工具调用 */
@@ -240,24 +240,39 @@ export async function runAgentTurn(
       }
 
       // ④-3 过程可视化 + 危险操作权限确认（确认方式由宿主注入：终端问询/桌面弹窗）
-      emit({ type: 'tool_call', step, maxSteps, name: tool.name, summary: tool.describe(args) });
-      if (tool.needsPermission) {
-        const isBash = tool.name === 'run_bash';
-        const detail = isBash ? String(args.command ?? '') : await previewForPermission(args);
-        const allowed = await confirm(
-          { title: isBash ? '执行命令' : '写入文件', detail, target: isBash ? undefined : String(args.path ?? '') },
-          opts.yolo,
-        );
-        if (!allowed) {
-          // 拒绝也要回传消息：模型必须知道"这次调用被用户否了"，否则它会一直干等
-          messages.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            content: '用户拒绝了此操作。请说明你的意图，或改用其他方案。',
-          });
-          emit({ type: 'tool_denied', name: tool.name });
-          continue;
+      //      target 让界面知道这次动的是哪个文件——桌面端据此给出"预览成果"入口。
+      //      这一整段都在 try 里：describe/emit/confirm 任何一处抛错，都必须
+      //      立刻给这次调用补一条 tool 回复，否则历史里会留下"有调用无结果"，
+      //      后续每次请求都会被端点以 400 拒绝。
+      let allowed = true;
+      try {
+        emit({
+          type: 'tool_call', step, maxSteps, name: tool.name, summary: tool.describe(args),
+          ...(typeof args.path === 'string' ? { target: args.path } : {}),
+        });
+        if (tool.needsPermission) {
+          const isBash = tool.name === 'run_bash';
+          const detail = isBash ? String(args.command ?? '') : await previewForPermission(args);
+          allowed = await confirm(
+            { title: isBash ? '执行命令' : '写入文件', detail, target: isBash ? undefined : String(args.path ?? '') },
+            opts.yolo,
+          );
         }
+      } catch (err) {
+        const msg = `工具调用准备失败：${(err as Error).message}`;
+        messages.push({ role: 'tool', tool_call_id: call.id, content: msg });
+        emit({ type: 'tool_result', name: tool.name, preview: msg.slice(0, 120) });
+        continue;
+      }
+      if (!allowed) {
+        // 拒绝也要回传消息：模型必须知道"这次调用被用户否了"，否则它会一直干等
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: '用户拒绝了此操作。请说明你的意图，或改用其他方案。',
+        });
+        emit({ type: 'tool_denied', name: tool.name });
+        continue;
       }
 
       // ④-4 真正执行。任何异常都转成文字回传——模型擅长读报错并自愈

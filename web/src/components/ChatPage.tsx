@@ -11,8 +11,11 @@
 import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api, type AgentEventPayload, type PermissionPayload, type AgentPreset } from '../api.js';
-import { SendIcon, ZapIcon, TerminalIcon, ShieldIcon, CheckIcon, XIcon, ChevronDownIcon, FolderIcon, SparkIcon } from './icons.js';
+import { api, type AgentEventPayload, type AgentPreset } from '../api.js';
+import { useWorkspace } from '../useWorkspace.js';
+import { useDismiss } from '../useDismiss.js';
+import WorkspacePicker from './WorkspacePicker.js';
+import { SendIcon, ZapIcon, TerminalIcon, CheckIcon, XIcon, ChevronDownIcon, SparkIcon, FileIcon } from './icons.js';
 
 /**
  * 助手消息的 Markdown 渲染：模型输出的是 Markdown（加粗/列表/代码块），
@@ -41,29 +44,33 @@ const PRESET_LABELS: Record<AgentPreset, string> = {
 
 /** 消息流里的一条渲染项 */
 type ChatItem =
-  | { kind: 'user'; text: string }
-  | { kind: 'assistant'; text: string }
-  | { kind: 'tool'; key: number; name: string; summary: string; step: number; status: 'running' | 'done' | 'denied'; preview?: string }
-  | { kind: 'notice'; text: string }
-  | { kind: 'meta'; text: string };
+  | { kind: 'user'; key: number; text: string }
+  | { kind: 'assistant'; key: number; text: string }
+  | { kind: 'tool'; key: number; name: string; summary: string; step: number; status: 'running' | 'done' | 'denied'; preview?: string; target?: string }
+  | { kind: 'notice'; key: number; text: string }
+  | { kind: 'meta'; key: number; text: string };
 
 const EXAMPLE_TASKS = ['看看这个项目结构', '帮我写一个 hello.py', '解释 package.json 的作用'];
 
 let itemSeq = 1;
 
-export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
+export default function ChatPage({ onTurnDone, onPreview }: { onTurnDone: () => void; onPreview?: (rel: string) => void }) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [thinkingStep, setThinkingStep] = useState(0);
-  const [permission, setPermission] = useState<PermissionPayload | null>(null);
   const [expandedTool, setExpandedTool] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  /** Composer pills：工作区 / 预设 / 当前模型名 */
-  const [workspace, setWorkspace] = useState('…');
+  /** Composer pills：预设 / 当前模型名（工作区由 WorkspacePicker + useWorkspace 统一管理） */
   const [preset, setPreset] = useState<AgentPreset>('standard');
   const [modelName, setModelName] = useState('');
   const [presetMenu, setPresetMenu] = useState(false);
+  /** 预设下拉的容器：点外面 / Esc 都能关（之前只能再点一次胶囊才关） */
+  const presetMenuRef = useRef<HTMLDivElement>(null);
+  useDismiss(presetMenu, presetMenuRef, () => setPresetMenu(false));
+  const [notice, setNotice] = useState<string | null>(null);
+  /** 本轮任务的工作区绝对路径——来自主进程，send 时原样回传 */
+  const ws = useWorkspace();
 
   // 订阅核心事件 → 更新消息流
   useEffect(() => {
@@ -77,7 +84,7 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
           setThinkingStep(0);
           break;
         case 'tool_call':
-          setItems((xs) => [...xs, { kind: 'tool', key: itemSeq++, name: evt.name, summary: evt.summary, step: evt.step, status: 'running' }]);
+          setItems((xs) => [...xs, { kind: 'tool', key: itemSeq++, name: evt.name, summary: evt.summary, step: evt.step, status: 'running', target: evt.target }]);
           break;
         case 'tool_result':
           setItems((xs) => {
@@ -100,16 +107,13 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
           });
           break;
         case 'usage':
-          setItems((xs) => [...xs, { kind: 'meta', text: `${evt.model} · ${evt.tokens ?? '?'} tokens` }]);
+          setItems((xs) => [...xs, { kind: 'meta', key: itemSeq++, text: `${evt.model} · ${evt.tokens ?? '?'} tokens` }]);
           break;
         case 'compacted':
-          setItems((xs) => [...xs, { kind: 'notice', text: '上下文已压缩' }]);
-          break;
-        case 'permission_request':
-          setPermission({ id: evt.id, title: evt.title, detail: evt.detail, target: evt.target });
+          setItems((xs) => [...xs, { kind: 'notice', key: itemSeq++, text: '上下文已压缩' }]);
           break;
         case 'answer':
-          setItems((xs) => [...xs, { kind: 'assistant', text: evt.answer }]);
+          setItems((xs) => [...xs, { kind: 'assistant', key: itemSeq++, text: evt.answer }]);
           setRunning(false);
           setThinkingStep(0);
           onTurnDone();
@@ -123,11 +127,14 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
   useEffect(() => {
     const reload = async () => {
       const { messages } = await api.currentMessages();
-      setItems(messages.map((m) =>
-        m.role === 'user' ? { kind: 'user' as const, text: m.content }
-        : m.role === 'assistant' ? { kind: 'assistant' as const, text: m.content }
-        : null,
-      ).filter((x): x is ChatItem => x !== null));
+      const restored = messages
+        .map((m): ChatItem | null =>
+          m.role === 'user' ? { kind: 'user', key: itemSeq++, text: m.content }
+          : m.role === 'assistant' ? { kind: 'assistant', key: itemSeq++, text: m.content }
+          : null,
+        )
+        .filter((x): x is ChatItem => x !== null);
+      setItems(restored);
     };
     // 挂载时也恢复一次：切到插件/设置页再回来不丢聊天内容
     void reload();
@@ -135,12 +142,8 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
     return () => window.removeEventListener('session-loaded', reload as EventListener);
   }, []);
 
-  // Composer pills 初始化：工作区 / 预设 / 当前模型名
+  // Composer pills 初始化：预设 / 当前模型名
   useEffect(() => {
-    void api.getAppInfo().then((info) => {
-      const parts = info.workspace.split('/');
-      setWorkspace(parts[parts.length - 1] || info.workspace);
-    }).catch(() => setWorkspace('工作区'));
     void api.getConfig().then((cfg) => {
       setPreset(cfg.activePreset ?? 'standard');
       const p = (cfg.providers ?? []).find((x) => x.id === cfg.activeProviderId) ?? cfg.providers?.[0];
@@ -153,16 +156,34 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [items, thinkingStep]);
 
+  // 输入框随内容长高（最多 140px，再多就内部滚动）——多行任务不用挤在 1 行里看
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  }, [input]);
+
   const send = async (task: string) => {
     const trimmed = task.trim();
     if (!trimmed || running) return;
-    setItems((xs) => [...xs, { kind: 'user', text: trimmed }]);
+    setItems((xs) => [...xs, { kind: 'user', key: itemSeq++, text: trimmed }]);
     setInput('');
     setRunning(true);
-    // 把 pills 的选择带给核心：工作区决定文件边界，预设决定人设与工具面
-    const res = await api.send(trimmed, { workspace, preset });
-    if (!res.ok && res.error) {
-      setItems((xs) => [...xs, { kind: 'notice', text: `出错了：${res.error}` }]);
+    setNotice(null);
+    // 把 pills 的选择带给核心：工作区决定文件边界（绝对路径），预设决定人设与工具面。
+    // 主进程 handler 有可能 reject（例如启动准备失败），必须兜住，
+    // 否则界面会永远停在"任务执行中"，输入框一直禁用。
+    try {
+      const res = await api.send(trimmed, { workspace: ws.workspace, preset });
+      if (!res.ok && res.error) {
+        setItems((xs) => [...xs, { kind: 'notice', key: itemSeq++, text: `出错了：${res.error}` }]);
+        setRunning(false);
+        setThinkingStep(0);
+      }
+    } catch (err) {
+      setItems((xs) => [...xs, { kind: 'notice', key: itemSeq++, text: `发送失败：${(err as Error).message}` }]);
       setRunning(false);
       setThinkingStep(0);
     }
@@ -181,18 +202,19 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
         </div>
       )}
 
-      <div className={hasChat ? 'chat-running' : 'chat-running'} style={hasChat ? undefined : { display: 'none' }}>
+      {/* 消息流只在"有内容"时渲染，空状态时整块隐藏（而非渲染空壳） */}
+      <div className="chat-running" hidden={!hasChat}>
         <div className="chat-scroll" ref={scrollRef} aria-busy={running}>
-          {items.map((item, i) => {
+          {items.map((item) => {
             switch (item.kind) {
               case 'user':
-                return <div key={i} className="msg msg-user">{item.text}</div>;
+                return <div key={item.key} className="msg msg-user">{item.text}</div>;
               case 'assistant':
-                return <div key={i} className="msg msg-assistant"><AssistantMarkdown text={item.text} /></div>;
+                return <div key={item.key} className="msg msg-assistant"><AssistantMarkdown text={item.text} /></div>;
               case 'notice':
-                return <div key={i} className="msg-notice">{item.text}</div>;
+                return <div key={item.key} className="msg-notice">{item.text}</div>;
               case 'meta':
-                return <div key={i} style={{ alignSelf: 'center', fontSize: 10.5, color: 'var(--fg-secondary)' }}>{item.text}</div>;
+                return <div key={item.key} style={{ alignSelf: 'center', fontSize: 10.5, color: 'var(--fg-secondary)' }}>{item.text}</div>;
               case 'tool': {
                 const expanded = expandedTool === item.key;
                 return (
@@ -208,6 +230,18 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
                       <span>{item.name}</span>
                       <span style={{ color: 'var(--fg-secondary)' }}>{item.summary}</span>
                       <span className="step-badge">第 {item.step} 步</span>
+                      {item.status === 'done' && item.target && (item.name === 'write_file' || item.name === 'edit_file') && (
+                        <span
+                          className="tool-preview-btn"
+                          role="button"
+                          tabIndex={0}
+                          title={`在客户端里预览 ${item.target}`}
+                          onClick={(e) => { e.stopPropagation(); onPreview?.(item.target!); }}
+                          onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onPreview?.(item.target!); } }}
+                        >
+                          <FileIcon size={12} /> 预览
+                        </span>
+                      )}
                       <span className={`tool-status status-${item.status}`}>
                         {item.status === 'running' && <span className="spinner" style={{ width: 10, height: 10 }} />}
                         {item.status === 'done' && <><CheckIcon size={12} /> 完成</>}
@@ -238,27 +272,15 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
           </div>
         )}
         <div className="composer-pills">
-          <button
-            className="pill"
-            title="选择本轮任务的工作区目录"
-            onClick={async () => {
-              const res = await api.chooseWorkspace();
-              if (res.ok && res.path) {
-                const parts = res.path.split('/');
-                setWorkspace(parts[parts.length - 1] || res.path);
-              }
-            }}
-          >
-            <FolderIcon size={12} /> {workspace} <ChevronDownIcon size={11} />
-          </button>
-          <div className="pill-menu">
-            <button className="pill" onClick={() => setPresetMenu((v) => !v)}>
+          <WorkspacePicker onNotice={setNotice} />
+          <div className="pill-menu" ref={presetMenuRef}>
+            <button className="pill" onClick={() => setPresetMenu((v) => !v)} aria-haspopup="menu" aria-expanded={presetMenu}>
               <SparkIcon size={12} /> {PRESET_LABELS[preset]} <ChevronDownIcon size={11} />
             </button>
             {presetMenu && (
-              <div className="pill-popover">
+              <div className="pill-popover" role="menu">
                 {(Object.keys(PRESET_LABELS) as AgentPreset[]).map((k) => (
-                  <button key={k} onClick={async () => {
+                  <button key={k} type="button" role="menuitem" onClick={async () => {
                     setPreset(k);
                     setPresetMenu(false);
                     await api.setPreset(k); // 持久化，新对话默认沿用
@@ -270,10 +292,11 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
               </div>
             )}
           </div>
-          <span className="pill pill-static" style={{ marginLeft: 'auto' }}>{modelName}</span>
+          <span className="pill pill-static" style={{ marginLeft: 'auto' }} title="当前模型">{modelName}</span>
         </div>
         <div className="composer-box">
           <textarea
+            ref={taRef}
             value={input}
             placeholder={running ? '任务执行中…' : '输入任务，⌘+回车 发送'}
             rows={1}
@@ -281,6 +304,7 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void send(input);
+              if (e.key === 'Escape') setPresetMenu(false);
             }}
             aria-label="任务输入框"
           />
@@ -288,34 +312,11 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
             <SendIcon size={15} />
           </button>
         </div>
-        <div className="composer-meta">
-          {running ? 'agent 正在执行，工具调用会先征求你的同意' : '工具调用前会请求权限 · 会话自动保存'}
+        <div className={`composer-meta${notice ? ' composer-notice' : ''}`} role={notice ? 'status' : undefined}>
+          {notice ?? (running ? 'agent 正在执行，工具调用会先征求你的同意' : '工具调用前会请求权限 · 会话自动保存')}
         </div>
       </div>
 
-      {permission && (
-        <div className="overlay" role="dialog" aria-modal="true" aria-label="权限确认">
-          <div className="sheet">
-            <h3><ShieldIcon size={17} /> 权限确认：{permission.title}</h3>
-            {permission.target && <div className="target">目标：{permission.target}</div>}
-            <div className="detail">{permission.detail}</div>
-            <div className="actions">
-              <button
-                className="btn"
-                onClick={() => { api.replyPermission(permission.id, false); setPermission(null); }}
-              >
-                <XIcon size={13} /> 拒绝
-              </button>
-              <button
-                className="btn btn-accent"
-                onClick={() => { api.replyPermission(permission.id, true); setPermission(null); }}
-              >
-                <CheckIcon size={13} /> 允许
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 }

@@ -26,7 +26,7 @@ import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { exec as execCb } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
 import { registerTool, unregisterByOwner, listTools, type Tool } from './tools/index.js';
 import { CONFIG_DIR, type HarnessConfig } from './config.js';
 
@@ -89,6 +89,22 @@ export interface MarketplaceIndex {
   plugins: MarketplaceEntry[];
 }
 
+/**
+ * 插件名守卫：名字会参与文件路径、进程参数，甚至"删除目录"。
+ * 允许字符限定在 [A-Za-z0-9._-]，且禁止 . / .. —— 否则
+ * name = "../../sessions" 就能让安装流程 rm -rf 掉会话目录。
+ */
+const PLUGIN_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+function assertPluginName(name: unknown): string {
+  if (typeof name !== 'string' || !PLUGIN_NAME_RE.test(name) || name === '.' || name === '..') {
+    throw new Error(`非法的插件名：${String(name)}（只允许字母、数字、点、下划线、连字符）`);
+  }
+  if (name === 'builtin') {
+    throw new Error('插件名 "builtin" 是保留名（内置工具的归属标记）');
+  }
+  return name;
+}
+
 /** 插件目录是否启用（缺省 = 启用） */
 export function isEnabled(cfg: HarnessConfig | undefined, name: string): boolean {
   return cfg?.plugins?.[name] !== false;
@@ -107,9 +123,11 @@ async function importPluginTools(dir: string, manifest: PluginManifest): Promise
     throw new Error('插件模块必须导出 tools 数组（命名导出或默认导出均可）');
   }
   // 形状校验：像 Tool 的才收——防御插件写错导致 harness 崩溃
-  return (tools as Tool[]).filter(
-    (t) => typeof t?.name === 'string' && typeof t?.execute === 'function',
-  );
+  return (tools as Tool[])
+    .filter((t) => typeof t?.name === 'string' && typeof t?.execute === 'function')
+    // describe 缺失时补一个：loop 会调用它生成摘要，缺了会抛异常并把
+    // 未闭合的 tool_calls 留在历史里（协议非法，之后每次请求都 400）。
+    .map((t) => ({ ...t, describe: typeof t.describe === 'function' ? t.describe : () => t.name }));
 }
 
 /** 读取插件目录（不注册），返回清单 + 工具名 + 启用状态 */
@@ -126,6 +144,11 @@ async function inspectPluginDir(dir: string, cfg: HarnessConfig | undefined): Pr
     };
   }
   const enabled = isEnabled(cfg, manifest.name);
+  // 禁用的插件**绝不 import**：import 会执行模块顶层代码（可能联网/读文件），
+  // 只在"注册工具"这一步拦是拦不住的——那等于禁用了个寂寞。
+  if (!enabled) {
+    return { manifest, dir, toolNames: [], loadError: null, enabled: false };
+  }
   try {
     const tools = await importPluginTools(dir, manifest);
     return { manifest, dir, toolNames: tools.map((t) => t.name), loadError: null, enabled };
@@ -143,16 +166,19 @@ export async function loadInstalledPlugins(cfg: HarnessConfig | undefined, regis
     return []; // 目录不存在 = 没装过插件
   }
   const results: InstalledPlugin[] = [];
-  for (const name of names.filter((n) => !n.startsWith('.'))) {
+  for (const name of names.filter((n) => !n.startsWith('.') && PLUGIN_NAME_RE.test(n))) {
     const dir = path.join(PLUGINS_DIR, name);
-    if (!(await fs.stat(dir)).isDirectory()) continue;
+    // 目录里可能有断链符号链接（或被并发删掉）：stat 失败就跳过这一个，
+    // 不能让一个坏条目把整个启动流程搞崩（原来的行为是 main() reject + exit 1）。
+    const st = await fs.stat(dir).catch(() => null);
+    if (!st?.isDirectory()) continue;
     const info = await inspectPluginDir(dir, cfg);
     // 启用且加载成功才注册；注册时打上归属标记（插件名），禁用时可成批注销
     if (register && info.enabled && !info.loadError) {
       const tools = await importPluginTools(dir, info.manifest);
       for (const tool of tools) {
         if (!listTools().some((t) => t.name === tool.name)) {
-          registerTool(tool, info.manifest.name);
+          registerTool(tool, pluginOwner(info.manifest.name));
         }
       }
     }
@@ -175,6 +201,11 @@ export async function setPluginEnabled(
   enabled: boolean,
   cfg: HarnessConfig,
 ): Promise<{ ok: boolean; message: string }> {
+  try {
+    assertPluginName(name);
+  } catch (err) {
+    return { ok: false, message: (err as Error).message };
+  }
   const dir = path.join(PLUGINS_DIR, name);
   if (!fsSync.existsSync(path.join(dir, 'plugin.json'))) {
     return { ok: false, message: `未找到插件 ${name}` };
@@ -186,7 +217,7 @@ export async function setPluginEnabled(
       let registered = 0;
       for (const tool of tools) {
         if (!listTools().some((t) => t.name === tool.name)) {
-          registerTool(tool, name);
+          registerTool(tool, pluginOwner(name));
           registered++;
         }
       }
@@ -195,14 +226,15 @@ export async function setPluginEnabled(
       return { ok: false, message: `启用失败：${(err as Error).message}` };
     }
   }
-  const removed = unregisterByOwner(name);
+  const removed = unregisterByOwner(pluginOwner(name));
   return { ok: true, message: `已禁用 ${name}（移除 ${removed} 个工具）` };
 }
 
 /** 卸载插件：先注销其工具，再删除目录 */
 export async function uninstallPlugin(name: string): Promise<void> {
-  unregisterByOwner(name);
-  await fs.rm(path.join(PLUGINS_DIR, name), { recursive: true, force: true });
+  assertPluginName(name);
+  unregisterByOwner(pluginOwner(name));
+  await fs.rm(path.join(PLUGINS_DIR, assertPluginName(name)), { recursive: true, force: true });
 }
 
 /**
@@ -210,7 +242,15 @@ export async function uninstallPlugin(name: string): Promise<void> {
  * bundled 来源 = 复制包内示例（离线可用）；github 来源 = 下载仓库 tarball 解压。
  */
 export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: boolean; message: string }> {
-  const dest = path.join(PLUGINS_DIR, entry.name);
+  let name: string;
+  try {
+    name = assertPluginName(entry.name);
+  } catch (err) {
+    return { ok: false, message: (err as Error).message };
+  }
+  const dest = path.join(PLUGINS_DIR, name);
+  let tarball: string | null = null;
+  let extractTo: string | null = null;
   try {
     if (entry.source.type === 'bundled') {
       // 内置示例：直接复制（Node 没有内置 cp -r，手动递归）
@@ -226,13 +266,14 @@ export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: b
       redirect: 'follow',
     });
     if (!res.ok) return { ok: false, message: `下载失败：HTTP ${res.status}` };
-    const tarball = path.join(os.tmpdir(), `nano-plugin-${entry.name}-${Date.now()}.tar.gz`);
+    tarball = path.join(os.tmpdir(), `nano-plugin-${name}-${Date.now()}.tar.gz`);
     await fs.writeFile(tarball, Buffer.from(await res.arrayBuffer()));
 
     // 解压到临时目录，再从里面把插件子目录拷出来
-    const extractTo = path.join(os.tmpdir(), `nano-plugin-${entry.name}-${Date.now()}`);
+    extractTo = path.join(os.tmpdir(), `nano-plugin-${name}-${Date.now()}`);
     await fs.mkdir(extractTo, { recursive: true });
-    await execTar(`-xzf ${JSON.stringify(tarball)} -C ${JSON.stringify(extractTo)}`);
+    // execFile 直接 execve，不经过 shell：名字里的 $(...) / 反引号无法再被解释
+    await execTar(['-xzf', tarball, '-C', extractTo]);
     const root = (await fs.readdir(extractTo))[0];
     if (!root) return { ok: false, message: '压缩包为空' };
     const pluginDir = path.join(extractTo, root, subdir ?? '');
@@ -242,12 +283,13 @@ export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: b
     await fs.mkdir(PLUGINS_DIR, { recursive: true });
     await fs.rm(dest, { recursive: true, force: true });
     await copyDir(manifestDir, dest);
-    // 清理临时文件
-    await fs.rm(tarball, { force: true });
-    await fs.rm(extractTo, { recursive: true, force: true });
-    return { ok: true, message: `已从 GitHub 安装 ${entry.name}` };
+    return { ok: true, message: `已从 GitHub 安装 ${name}` };
   } catch (err) {
     return { ok: false, message: `安装失败：${(err as Error).message}` };
+  } finally {
+    // 无论成功失败都清干净，别把 tarball 和解压目录留在 ~/tmp
+    if (tarball) await fs.rm(tarball, { force: true }).catch(() => {});
+    if (extractTo) await fs.rm(extractTo, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -274,11 +316,16 @@ async function copyDir(src: string, dest: string): Promise<void> {
   }
 }
 
-/** 调用系统 tar 命令（macOS/Linux 自带；Windows 用户暂不支持 github 来源安装） */
-function execTar(args: string): Promise<void> {
+/** 调用系统 tar（macOS/Linux 自带；Windows 暂不支持 github 来源安装） */
+function execTar(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    execCb(`tar ${args}`, { timeout: 60_000 }, (err) => (err ? reject(err) : resolve()));
+    execFileCb('tar', args, { timeout: 60_000 }, (err) => (err ? reject(err) : resolve()));
   });
+}
+
+/** 工具归属：插件一律加 plugin: 前缀，避免插件名叫 builtin 时误注销内置工具 */
+function pluginOwner(name: string): string {
+  return `plugin:${name}`;
 }
 
 /** 向下查找包含 plugin.json 的目录（最多三层） */

@@ -1,7 +1,7 @@
 {
   "name": "nano-harness",
-  "version": "0.3.0",
-  "description": "零依赖、模块化的 AI Agent Harness —— 终端 CLI + macOS 桌面应用 + 插件市场",
+  "version": "0.4.0",
+  "description": "零依赖、模块化的 AI Agent Harness —— 终端 CLI + macOS 桌面应用 + 成果预览 + 插件市场",
   "type": "module",
   "main": "dist/cli.js",
   "bin": {
@@ -16,13 +16,17 @@
     "build:preload": "esbuild desktop/preload.ts --bundle --platform=node --external:electron --format=cjs --outfile=dist-desktop/preload.cjs",
     "build:ui": "vite build --config web/vite.config.ts",
     "build:all": "npm run build && npm run build:desktop && npm run build:preload && npm run build:ui",
+    "typecheck": "tsc --noEmit && tsc -p desktop/tsconfig.typecheck.json && tsc -p web/tsconfig.json",
     "pack": "npm run build:all && electron-builder --mac",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "desktop": "npm run build:all && electron dist-desktop/main.js",
     "ui:dev": "vite dev --config web/vite.config.ts",
     "mock": "node scripts/mock-server.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && node --test tests/",
+    "test:only": "node --test tests/",
+    "check": "npm run typecheck && npm run test:only"
   },
   "keywords": [
     "ai",
@@ -37,7 +41,9 @@
     "electron",
     "plugin-marketplace"
   ],
-  "author": "xiaocube",
+  "author": {
+    "name": "xiaocube"
+  },
   "license": "MIT",
   "build": {
     "appId": "cc.xiaocube.nano-harness",
@@ -64,14 +70,19 @@
         ]
       },
       "identity": null,
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.png"
     }
   },
   "files": [
     "dist",
+    "dist-desktop",
+    "web/dist",
+    "marketplace",
+    "examples",
     "README.md",
     "LICENSE",
-    "marketplace"
+    "CHANGELOG.md"
   ],
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -88,5 +99,13 @@
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vite": "^8.3.3"
+  },
+  "homepage": "https://github.com/xiaocube/nano-harness#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaocube/nano-harness.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaocube/nano-harness/issues"
   }
 }

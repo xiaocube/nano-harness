@@ -33,6 +33,20 @@ export function estimateMessagesTokens(messages: ChatMessage[]): number {
 const KEEP_RECENT = 6;
 
 /**
+ * 找安全的切分点：从末尾往前保留 keepRecent 条，但如果切在了 tool 消息上，
+ * 就继续往前退到它的 assistant(tool_calls) 之前——保证"调用+结果"整组不被拆散。
+ */
+function safeSplitIndex(rest: ChatMessage[], keepRecent: number): number {
+  let idx = Math.max(0, rest.length - keepRecent);
+  while (idx > 0 && rest[idx]?.role === 'tool') idx--;
+  // 若切点正好落在 assistant(tool_calls) 之后的第一条 tool 上，上面已处理；
+  // 再检查切点前一条是否是被"腰斩"的 assistant(tool_calls)（它自己没有结果留下）
+  const before = rest[idx - 1];
+  if (idx > 0 && before?.role === 'assistant' && before.tool_calls?.length) idx--;
+  return idx;
+}
+
+/**
  * 检查历史是否超限，超限则压缩。
  *
  * @param messages 当前完整历史（system + 对话）
@@ -50,10 +64,21 @@ export async function maybeCompact(
 
   // 拆成三段：system 提示（永远保留且永远在最前）/ 旧历史（待压缩）/ 最近消息（保留原文）
   const [system, ...rest] = messages;
-  const oldPart = rest.slice(0, Math.max(0, rest.length - KEEP_RECENT));
-  const recentPart = rest.slice(-KEEP_RECENT);
+  // 切分点必须落在"消息组"边界上：协议要求 tool 消息紧跟带 tool_calls 的
+  // assistant 消息，按固定条数硬切会把它们拆散 → 端点返回 400，且因为
+  // loop 是原地替换 history，这条坏历史还会被存进会话文件，再也发不出去。
+  const split = safeSplitIndex(rest, KEEP_RECENT);
+  const oldPart = rest.slice(0, split);
+  const recentPart = rest.slice(split);
   if (oldPart.length === 0) {
     return { messages, compacted: false }; // 除了最近几轮没有可压缩的
+  }
+  // 只剩上一次的摘要可压：再压就是"摘要的摘要"，白花钱且越压越丢信息
+  const hasRealContent = oldPart.some(
+    (m) => !(m.role === 'user' && m.content.startsWith('【此前对话的摘要')),
+  );
+  if (!hasRealContent) {
+    return { messages, compacted: false };
   }
 
   // 让同一个模型来当"会议纪要员"：把旧历史浓缩成结构化摘要
@@ -66,22 +91,28 @@ export async function maybeCompact(
     })
     .join('\n');
 
-  const summaryRes = await callChat(
-    cfg,
-    [
-      {
-        role: 'system',
-        content:
-          '你是对话摘要助手。把给定的对话历史压缩成一份结构化摘要，供后续对话作为背景知识。' +
-          '必须保留：用户的最终目标、已做出的关键决定、已创建/修改过的文件路径、重要命令的执行结果、尚未解决的问题。' +
-          '直接输出摘要正文，不要任何开场白。',
-      },
-      { role: 'user', content: `请总结以下对话历史：\n\n${transcript.slice(0, cfg.contextChars)}` },
-    ],
-    [], // 摘要过程不需要工具
-  );
-
-  const summary = summaryRes.message.content;
+  let summary: string;
+  try {
+    const summaryRes = await callChat(
+      cfg,
+      [
+        {
+          role: 'system',
+          content:
+            '你是对话摘要助手。把给定的对话历史压缩成一份结构化摘要，供后续对话作为背景知识。' +
+            '必须保留：用户的最终目标、已做出的关键决定、已创建/修改过的文件路径、重要命令的执行结果、尚未解决的问题。' +
+            '直接输出摘要正文，不要任何开场白。',
+        },
+        { role: 'user', content: `请总结以下对话历史：\n\n${transcript.slice(0, cfg.contextChars)}` },
+      ],
+      [], // 摘要过程不需要工具
+    );
+    summary = summaryRes.message.content;
+  } catch {
+    // 摘要调用失败（网络/额度）不能让整轮对话卡死：放弃压缩，照常继续
+    return { messages, compacted: false };
+  }
+  if (!summary.trim()) return { messages, compacted: false };
   const compacted: ChatMessage[] = [
     system, // 人设规则回到最前
     {

@@ -13,12 +13,25 @@
  * 渲染进程（React 界面）只是"眼睛和嘴"，被 contextIsolation 隔离。
  */
 
-import { app, BrowserWindow, Menu, nativeTheme, ipcMain } from 'electron';
+import { app, BrowserWindow, Menu, nativeTheme, ipcMain, protocol, dialog, shell } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createAgentBridge } from './agent-bridge.js';
 import { loadConfig } from '../dist/config.js';
+
+/**
+ * 成果预览用的自定义协议。必须在 app ready **之前**声明特权。
+ * 有了它，被预览的 HTML 就是"另一个真实 URL"——不继承应用页面的 CSP，
+ * 页面里的内联 <script> 能正常跑（data: URL 做不到：实测会被 default-src 'self' 拦掉），
+ * 同时相对路径引用的 CSS/JS/图片也能顺着同一个协议取到。
+ */
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'nh-file',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
+]);
 
 // ESM 下没有 __dirname，用 import.meta 推导
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,12 +61,32 @@ function createWindow(): void {
     },
   });
 
-  // 生产模式加载构建产物；开发模式加载 vite 热更新服务
-  if (DEV_SERVER_URL) {
-    void mainWindow.loadURL(DEV_SERVER_URL);
-  } else {
-    void mainWindow.loadFile(path.join(dirname, '../web/dist/index.html'));
-  }
+  // 生产模式加载构建产物；开发模式加载 vite 热更新服务。
+  // 加载失败必须让人看见（以前是 void + 未处理拒绝 → 白屏没提示）。
+  const load = DEV_SERVER_URL
+    ? mainWindow.loadURL(DEV_SERVER_URL)
+    : mainWindow.loadFile(path.join(dirname, '../web/dist/index.html'));
+  void load.catch((err) => {
+    dialog.showErrorBox('界面加载失败', `${(err as Error).message}\n\n请先执行 npm run build:ui 生成 web/dist。`);
+    app.quit();
+  });
+
+  // ---- 导航加固：渲染层里跑着强大的 preload，绝不能让窗口跳到别的文档 ----
+  // 否则把一个下载来的 evil.html 拖进窗口，它就能调用 window.nanoharness
+  // （读配置里的 API Key、读工作区文件）。
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const allowed = DEV_SERVER_URL ? url.startsWith(DEV_SERVER_URL) : url.startsWith('file://');
+    if (!allowed) {
+      event.preventDefault();
+      void shell.openExternal(url);
+    }
+  });
+  // 链接（助手回答里的 http 链接）一律交给系统浏览器，不开 Electron 子窗口
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
     // 自动化验收钩子：设置 NANO_CAPTURE=path 时，稳定后截图并退出（CI/回归用）

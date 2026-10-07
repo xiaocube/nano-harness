@@ -28,25 +28,51 @@ const MAX_ENTRIES = 500;
  * @returns 校验通过后的绝对路径
  * @throws 越界时抛错（错误信息会回传给模型，让它自己修正）
  */
-function guardPath(workspace: string, userPath: string): string {
-  if (!userPath || typeof userPath !== 'string') {
+async function guardPath(workspace: string, userPath: unknown): Promise<string> {
+  if (typeof userPath !== 'string' || !userPath) {
     throw new Error('路径参数缺失');
   }
   const abs = path.resolve(workspace, userPath); // 相对路径 → 以 workspace 为基准解析
-  const root = path.resolve(workspace);
-  //startsWith 判断 + 分隔符后缀，防止 /workspace-evil 伪装成 /workspace 的子目录
-  if (abs !== root && !abs.startsWith(root + path.sep)) {
-    throw new Error(
-      `安全限制：路径 "${userPath}" 超出工作区边界。只能操作工作区内的文件（${root}）`,
-    );
+
+  // 用真实路径比对：只做字符串前缀判断的话，工作区里的一个符号链接
+  // （ln -s /etc link）就能把读写带到工作区之外——这是真实的越狱路径。
+  // 目标可能还不存在（新建文件），所以要向上找到最近的已存在祖先再 realpath。
+  const root = await realRoot(workspace);
+  let probe = abs;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = await fs.realpath(probe);
+      const full = tail.length ? path.join(real, ...tail.reverse()) : real;
+      assertInside(full, root, userPath);
+      return abs;
+    } catch (err) {
+      if ((err as Error).message.startsWith('安全限制')) throw err;
+      const parent = path.dirname(probe);
+      if (parent === probe) {
+        throw new Error(`安全限制：无法解析路径 "${userPath}"`);
+      }
+      tail.push(path.basename(probe));
+      probe = parent;
+    }
   }
-  return abs;
 }
 
-/** 截断超长输出，并告诉模型"被截断了"，方便它决定是否分段读取 */
-function truncate(text: string): string {
-  if (text.length <= MAX_OUTPUT) return text;
-  return `${text.slice(0, MAX_OUTPUT)}\n\n[输出已截断，原文共 ${text.length} 字符。可用 offset 精确读取后续部分]`;
+/** 工作区根目录的真实路径（工作区本身也可能是个符号链接） */
+async function realRoot(workspace: string): Promise<string> {
+  try {
+    return await fs.realpath(path.resolve(workspace));
+  } catch {
+    return path.resolve(workspace);
+  }
+}
+
+/** 真实路径必须在工作区内：加分隔符后缀，防止 /workspace-evil 伪装成子目录 */
+function assertInside(realPath: string, root: string, userPath: string): void {
+  if (realPath === root || realPath.startsWith(root + path.sep)) return;
+  throw new Error(
+    `安全限制：路径 "${userPath}" 超出工作区边界。只能操作工作区内的文件（${root}）`,
+  );
 }
 
 /** 四个文件工具的统一注册入口（由 tools/index.ts 调用） */
@@ -61,15 +87,26 @@ export function registerFsTools(): void {
       type: 'object',
       properties: {
         path: { type: 'string', description: '文件路径，相对于工作区或工作区内的绝对路径' },
+        offset: { type: 'number', description: '从第几个字符开始读（默认 0）。被截断后用它继续读后续部分' },
+        limit: { type: 'number', description: '最多读多少个字符（默认 40000，上限 40000）' },
       },
       required: ['path'],
     },
     needsPermission: false, // 只读不危险
     describe: (args) => String(args.path ?? ''),
     execute: async (args, ctx) => {
-      const abs = guardPath(ctx.workspace, String(args.path));
+      const abs = await guardPath(ctx.workspace, args.path);
       const content = await fs.readFile(abs, 'utf8');
-      return truncate(content);
+      // offset/limit 让模型能分段读完大文件（否则尾部永远读不到）
+      const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
+      const limit = Math.min(MAX_OUTPUT, Math.max(1, Math.floor(Number(args.limit ?? MAX_OUTPUT)) || MAX_OUTPUT));
+      if (offset === 0 && content.length <= limit) return content;
+      const slice = content.slice(offset, offset + limit);
+      const next = offset + slice.length;
+      const more = next < content.length
+        ? `\n\n[已读 ${offset}-${next} / 共 ${content.length} 字符，继续读请用 offset=${next}]`
+        : `\n\n[已读 ${offset}-${next} / 共 ${content.length} 字符，文件已读完]`;
+      return slice + more;
     },
   };
 
@@ -90,7 +127,7 @@ export function registerFsTools(): void {
     needsPermission: true, // 覆盖文件 = 破坏性操作
     describe: (args) => `${args.path}（${String(args.content ?? '').length} 字符）`,
     execute: async (args, ctx) => {
-      const abs = guardPath(ctx.workspace, String(args.path));
+      const abs = await guardPath(ctx.workspace, args.path);
       const content = String(args.content ?? '');
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, content, 'utf8');
@@ -116,7 +153,7 @@ export function registerFsTools(): void {
     needsPermission: true,
     describe: (args) => `${args.path}（替换 ${String(args.old_string ?? '').length} 字符片段）`,
     execute: async (args, ctx) => {
-      const abs = guardPath(ctx.workspace, String(args.path));
+      const abs = await guardPath(ctx.workspace, args.path);
       const oldStr = String(args.old_string ?? '');
       const newStr = String(args.new_string ?? '');
       const content = await fs.readFile(abs, 'utf8');
@@ -148,7 +185,7 @@ export function registerFsTools(): void {
     needsPermission: false,
     describe: (args) => String(args.path ?? '.'),
     execute: async (args, ctx) => {
-      const abs = guardPath(ctx.workspace, String(args.path ?? '.'));
+      const abs = await guardPath(ctx.workspace, args.path ?? '.');
       const entries = await fs.readdir(abs, { withFileTypes: true });
       if (entries.length === 0) return '(空目录)';
       // 目录排前、文件排后，各按名称排序，模型读起来更省 token
@@ -170,8 +207,16 @@ export function registerFsTools(): void {
 
 /** 供 loop 层在权限确认框里展示写操作内容预览 */
 export async function previewForPermission(args: Record<string, unknown>): Promise<string> {
-  const content = String(args.content ?? '');
-  const lines = content.split('\n');
-  const head = lines.slice(0, 15).join('\n');
-  return lines.length > 15 ? `${head}\n…（共 ${lines.length} 行）` : head;
+  const clip = (text: string, maxLines = 15): string => {
+    const lines = text.split('\n');
+    const head = lines.slice(0, maxLines).join('\n');
+    return lines.length > maxLines ? `${head}\n…（共 ${lines.length} 行）` : head;
+  };
+  // edit_file 的参数是 old/new 两段文本：不预览的话用户是在"批准一次看不见的改动"
+  if ('old_string' in args || 'new_string' in args) {
+    const del = clip(String(args.old_string ?? ''), 8);
+    const add = clip(String(args.new_string ?? ''), 8);
+    return `将要删除的片段：\n${del}\n\n将要替换为：\n${add}`;
+  }
+  return clip(String(args.content ?? ''));
 }

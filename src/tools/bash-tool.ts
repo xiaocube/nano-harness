@@ -45,43 +45,77 @@ export function registerBashTool(): void {
       const timeoutSec = Math.min(Number.isFinite(requested) && requested > 0 ? requested : 30, MAX_TIMEOUT_SEC);
 
       return new Promise<string>((resolve) => {
-        // cwd 锁定在工作区：命令默认在项目根目录下执行
+        // detached: true 让子进程成为新进程组的组长——这样才能整组杀掉。
+        // 只 kill 直接子进程的话，命令里 `&` 起的后代仍活着并占着管道，
+        // 'close' 事件永远不来，超时形同虚设（agent 会卡到天荒地老）。
         const child = spawn('bash', ['-c', command], {
           cwd: ctx.workspace,
           env: { ...process.env, NANO_HARNESS: '1' }, // 让被调用的程序知道自己在 agent 环境里
+          detached: true,
         });
 
         let out = '';
-        const collect = (chunk: Buffer) => {
-          out += chunk.toString('utf8');
-          // 超过上限就提前终止：没必要让进程继续产出用不到的数据
-          if (out.length > MAX_OUTPUT * 2) child.kill('SIGKILL');
+        let settled = false;
+        /** 记下"为什么被杀"，别再把它当成超时（会误导模型） */
+        let killedFor: 'timeout' | 'output' | null = null;
+
+        const killGroup = (reason: 'timeout' | 'output') => {
+          killedFor = killedFor ?? reason;
+          try {
+            // 负号 = 整个进程组（含孙子进程）
+            process.kill(-child.pid!, 'SIGKILL');
+          } catch {
+            try { child.kill('SIGKILL'); } catch { /* 已经退出了 */ }
+          }
         };
-        child.stdout.on('data', collect);
-        child.stderr.on('data', collect);
 
-        // 超时熔断：到点杀进程，并如实告诉模型"是超时被杀的"
-        const timer = setTimeout(() => {
-          child.kill('SIGKILL');
-        }, timeoutSec * 1000);
-
-        child.on('error', (err) => {
+        const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
-          resolve(`错误：无法启动进程：${err.message}`);
-        });
-
-        child.on('close', (code, signal) => {
-          clearTimeout(timer);
+          // 关掉管道，避免残留流让事件循环挂着
+          child.stdout?.destroy();
+          child.stderr?.destroy();
           const truncated =
             out.length > MAX_OUTPUT
               ? out.slice(0, MAX_OUTPUT) + `\n[输出已截断，原文共 ${out.length} 字符]`
               : out;
-          if (signal === 'SIGKILL') {
-            resolve(truncated + `\n[命令超过 ${timeoutSec}s 超时被终止，退出信号 SIGKILL]`);
+          if (killedFor === 'timeout') {
+            resolve(truncated + `\n[命令超过 ${timeoutSec}s 未结束，已终止整个进程组]`);
+          } else if (killedFor === 'output') {
+            resolve(truncated + `\n[输出超过 ${MAX_OUTPUT * 2} 字符，已提前终止]`);
+          } else if (signal) {
+            resolve(truncated + `\n[命令被信号 ${signal} 终止]`);
           } else {
             // 退出码附在末尾：0 = 成功，非 0 = 失败，模型据此判断命令是否成功
             resolve(truncated + `\n[退出码: ${code}]`);
           }
+        };
+
+        const collect = (chunk: Buffer) => {
+          out += chunk.toString('utf8');
+          // 超过上限就提前终止：没必要让进程继续产出用不到的数据
+          if (out.length > MAX_OUTPUT * 2) killGroup('output');
+        };
+        child.stdout.on('data', collect);
+        child.stderr.on('data', collect);
+
+        // 超时熔断：到点把整组进程杀掉
+        const timer = setTimeout(() => killGroup('timeout'), timeoutSec * 1000);
+
+        child.on('error', (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(`错误：无法启动进程：${err.message}`);
+        });
+
+        // 用 'exit' 而不是 'close'：'close' 要等所有 stdio 关闭，
+        // 而后代进程可能一直占着管道不放——那正是卡死的根源。
+        child.on('exit', (code, signal) => finish(code, signal));
+        // 兜底：万一 'exit' 没来（极少见），1 秒后也要给出结果
+        child.on('close', (code, signal) => {
+          setTimeout(() => finish(code, signal), 1000);
         });
       });
     },

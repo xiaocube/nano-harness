@@ -1,0 +1,40 @@
+# nano-harness CI：三端类型检查 + 136 个自动化用例 + 构建
+# 所有测试都跑在 mock 与隔离目录上，不需要任何 API Key。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-latest # mac 环境与开发机一致（arm64）；测试本身全平台可跑
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查（core + desktop + web）
+        run: npm run typecheck
+
+      - name: 单元与集成测试（node:test，无需 API Key）
+        run: npm run test:only
+
+      - name: 全量构建（核心 + 桌面 + 界面）
+        run: npm run build:all
+
+      - name: CLI 冒烟（mock 模型端到端）
+        run: |
+          node scripts/mock-server.mjs & MOCK_PID=$!
+          sleep 2
+          node dist/cli.js "冒烟测试" --base-url http://127.0.0.1:8787/v1 --api-key mock --model mock-model --yolo | tee /tmp/smoke.txt
+          kill $MOCK_PID
+          grep -q "nano-harness-mock-ok" /tmp/smoke.txt

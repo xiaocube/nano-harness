@@ -18,13 +18,13 @@ import { stdin, stdout } from 'node:process';
 import { C, banner, printAnswer, startSpinner, printToolCall, printToolResult, printUsage } from './ui.js';
 import { loadConfig, saveConfig, configExists, isConfigUsable, getActiveProvider, PRESETS, type HarnessConfig } from './config.js';
 import { registerBuiltinTools, listTools } from './tools/index.js';
-import { runAgentTurn, type LoopOptions, type AgentEvent } from './loop.js';
+import { runAgentTurn, PRESET_DEFS, type LoopOptions, type AgentEvent } from './loop.js';
 import { setAskQuestion } from './permission.js';
 import { saveSession, listSessions, loadSession } from './session.js';
 import { loadInstalledPlugins } from './plugins.js';
 import type { ChatMessage } from './llm.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 /**
  * 把核心事件翻译成终端渲染——CLI 是核心事件的第一个订阅者。
@@ -79,6 +79,8 @@ function printHelp(): void {
     --base-url <url>       临时覆盖 API 地址（OpenAI 兼容）
     --api-key <key>        临时覆盖 API Key（更推荐用环境变量）
     --yolo                 跳过所有权限确认（仅建议在沙箱/容器中使用）
+    --no-yolo              强制打开权限确认（覆盖配置里的 yolo）
+    --reconfigure          重新跑一遍配置向导
     --help                 显示本帮助
     --version              显示版本号
 
@@ -95,16 +97,44 @@ function printHelp(): void {
 
 /* ---------------- 首启向导 ---------------- */
 
+/** 一次性读完 stdin（管道/重定向场景）；TTY 下返回 null 表示该走交互提问 */
+async function readBatchLines(): Promise<string[] | null> {
+  if (stdin.isTTY) return null;
+  // 注意：管道里的 stdin 按"数据块"产出，不是按行——必须自己读全再切分。
+  // 直接 for await 会拿到一整块（多行粘在一起），答案会错位。
+  let raw = '';
+  for await (const chunk of stdin) raw += chunk.toString('utf8');
+  return raw.split(/\r?\n/);
+}
+
+/**
+ * 造一个"提问函数"：交互终端用 readline，非交互直接用预读的行。
+ * 为什么非交互不能也用 readline：管道数据写完后会**立刻**触发 close，
+ * 第二个 question() 就抛 ERR_USE_AFTER_CLOSE，后面的答案全丢。
+ */
+function makeAsker(rl: readline.Interface | null, batch: string[] | null) {
+  let i = 0;
+  return async (question: string): Promise<string> => {
+    if (!batch) return rl!.question(question);
+    process.stdout.write(question);
+    const answer = batch[i++] ?? '';
+    console.log(answer);
+    return answer;
+  };
+}
+
 /** 第一次使用时的三步配置向导：选厂商 → 粘 Key → 选模型，然后落盘 */
 async function runWizard(cfg: HarnessConfig): Promise<HarnessConfig> {
   console.log(C.cyan('\n  👋 欢迎使用 nano-harness！检测到这是首次运行，先做个 30 秒配置。\n'));
 
-  const rl = readline.createInterface({ input: stdin, output: stdout });
+  const batch = await readBatchLines();
+  const rl = batch ? null : readline.createInterface({ input: stdin, output: stdout });
+  const ask = makeAsker(rl, batch);
 
   // 第 1 步：选厂商（预设了 base_url，用户零记忆负担）
   console.log('  可用的模型服务商（都会随更新扩充）：');
   PRESETS.forEach((p, i) => console.log(`    ${i + 1}. ${p.label}`));
-  const pick = await rl.question(C.bold(`  选择 [1-${PRESETS.length}]，回车默认 1: `));
+  const pick = await ask(C.bold(`  选择 [1-${PRESETS.length}]，回车默认 1: `));
   const preset = PRESETS[Number(pick.trim() || '1') - 1] ?? PRESETS[0];
   console.log(C.gray(`  ${preset.keyHint}\n`));
 
@@ -112,30 +142,40 @@ async function runWizard(cfg: HarnessConfig): Promise<HarnessConfig> {
 
   // 第 2 步：API Key（本地模型跳过）
   if (preset.needsKey || preset.key === 'custom') {
-    const key = await rl.question(C.bold('  粘贴你的 API Key: '));
+    const key = await ask(C.bold('  粘贴你的 API Key: '));
     cfg.apiKey = key.trim();
   }
 
   // 第 3 步：模型名（回车用推荐默认值）
   if (preset.defaultModel) {
-    const model = await rl.question(C.bold(`  模型名 [回车默认 ${preset.defaultModel}]: `));
+    const model = await ask(C.bold(`  模型名 [回车默认 ${preset.defaultModel}]: `));
     cfg.model = model.trim() || preset.defaultModel;
   } else {
-    const model = await rl.question(C.bold('  模型名: '));
+    const model = await ask(C.bold('  模型名: '));
     cfg.model = model.trim();
   }
   if (preset.key === 'custom') {
-    const base = await rl.question(C.bold('  API base_url（如 https://api.example.com/v1）: '));
+    const base = await ask(C.bold('  API base_url（如 https://api.example.com/v1）: '));
     if (base.trim()) cfg.baseUrl = base.trim();
   }
 
-  rl.close();
+  rl?.close();
+  // 关键：callChat 走的是 getActiveProvider(cfg)，只改顶层字段等于没配——
+  // 用户会拿着填好的 Key 收到 401（真实 bug，首次使用必经之路）。
+  const active = getActiveProvider(cfg);
+  const merged = { ...active, baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: cfg.model };
+  cfg.providers = (cfg.providers ?? []).map((p) => (p.id === active.id ? merged : p));
+  if (!cfg.providers.some((p) => p.id === active.id)) cfg.providers = [merged, ...cfg.providers];
+  cfg.activeProviderId = active.id;
   await saveConfig(cfg);
   console.log(C.green(`\n  ✅ 配置已保存到 ${'~/.nano-harness/config.json'}（随时可手动编辑或删除重配）\n`));
   return cfg;
 }
 
 /* ---------------- REPL 的斜杠命令 ---------------- */
+
+/** 主循环的提问函数：/resume 这类交互复用它，避免开第二个 readline 抢 stdin */
+let askLine: (q: string) => Promise<string> = async () => '';
 
 /** 处理 /开头 的本地命令。返回 'exit' 表示要退出，'handled' 表示已处理，否则当任务发给模型 */
 async function handleCommand(
@@ -182,10 +222,14 @@ async function handleCommand(
     }
 
     case '/model': {
+      const active = getActiveProvider(cfg);
       if (!arg) {
-        console.log(`  当前模型: ${C.bold(cfg.model)}  （用法：/model <模型名>）`);
+        console.log(`  当前模型: ${C.bold(active.model)}  （用法：/model <模型名>）`);
       } else {
+        // 顶层 model 只是旧字段镜像；真正发请求用的是当前提供商
         cfg.model = arg;
+        active.model = arg;
+        cfg.providers = (cfg.providers ?? []).map((p) => (p.id === active.id ? active : p));
         await saveConfig(cfg);
         console.log(`  ${C.green('✓')} 模型已切换为 ${C.bold(arg)}（已写入配置）`);
       }
@@ -216,9 +260,8 @@ async function handleCommand(
         return 'handled';
       }
       sessions.forEach((s, i) => console.log(`    ${i + 1}. [${s.createdAt.slice(0, 16).replace('T', ' ')}] ${s.title}`));
-      const rl = readline.createInterface({ input: stdin, output: stdout });
-      const pick = await rl.question(C.bold(`  选择要恢复的会话 [1-${sessions.length}]: `));
-      rl.close();
+      // 复用主循环的 readline，绝不在这里再开一个（两个监听者会抢同一份 stdin）
+      const pick = await askLine(C.bold(`  选择要恢复的会话 [1-${sessions.length}]: `));
       const chosen = sessions[Number(pick.trim()) - 1];
       if (!chosen) {
         console.log(C.gray('  无效选择，已取消。'));
@@ -227,6 +270,12 @@ async function handleCommand(
       const loaded = await loadSession(chosen.file);
       messages.length = 0;
       messages.push(...loaded);
+      // 恢复的历史里带着旧会话的 system 提示词（里面有旧的工作目录/预设）。
+      // 现在的工作区可能已经变了，必须换掉，否则模型会去操作已被围栏挡住的老路径。
+      const sysIdx = messages.findIndex((m) => m.role === 'system');
+      const freshSystem = PRESET_DEFS[cfg.activePreset ?? 'standard'].system(workspace);
+      if (sysIdx >= 0) messages[sysIdx] = { role: 'system', content: freshSystem };
+      else messages.unshift({ role: 'system', content: freshSystem });
       console.log(C.green(`  ✓ 已恢复会话「${chosen.title}」（${loaded.length} 条消息），接着聊即可。`));
       return 'handled';
     }
@@ -252,12 +301,14 @@ async function main(): Promise<void> {
     allowPositionals: true,
     options: {
       yolo: { type: 'boolean', default: false },
+      'no-yolo': { type: 'boolean', default: false },
       dir: { type: 'string' },
       model: { type: 'string' },
       'base-url': { type: 'string' },
       'api-key': { type: 'string' },
       help: { type: 'boolean', default: false },
       version: { type: 'boolean', default: false },
+      'reconfigure': { type: 'boolean', default: false },
     },
   });
 
@@ -269,7 +320,9 @@ async function main(): Promise<void> {
   if (values['base-url']) cfg.baseUrl = values['base-url'];
   if (values['api-key']) cfg.apiKey = values['api-key'];
   if (values.model) cfg.model = values.model;
-  cfg.yolo = values.yolo || cfg.yolo;
+  // --yolo 打开；--no-yolo 显式关掉配置里的 yolo（CI 里想强制每次确认时用得上）
+  if (values['no-yolo']) cfg.yolo = false;
+  else if (values.yolo) cfg.yolo = true;
   // v0.3 多提供商：CLI 临时参数必须同步进"当前提供商"，
   // 否则 callChat 走 getActiveProvider 会绕过 --base-url/--api-key/--model
   {
@@ -283,7 +336,7 @@ async function main(): Promise<void> {
 
   // 首启判断：仅在"既没有命令行临时配置、配置也不可用"时才走向导。
   // （一次性任务模式用 --base-url/--api-key 直跑时不应被向导拦住）
-  if (!isConfigUsable(cfg) && !(await configExists())) {
+  if (!isConfigUsable(cfg) && (!(await configExists()) || values.reconfigure)) {
     cfg = await runWizard(cfg);
     if (!isConfigUsable(cfg)) {
       console.log(C.red('  配置仍不完整（缺少 API Key 或模型名）。可重新运行 nh 再次配置，或手动编辑 ~/.nano-harness/config.json'));
@@ -312,7 +365,8 @@ async function main(): Promise<void> {
     try {
       const { answer, messages: updated } = await runAgentTurn(messages, task, loopOpts);
       printAnswer(answer);
-      await saveSession(updated);
+      // 记下工作区：桌面端侧栏据此把会话挂到对应文件夹下
+      await saveSession(updated, undefined, workspace);
     } catch (err) {
       console.error(C.red(`\n  ✗ ${(err as Error).message}`));
       process.exitCode = 1;
@@ -322,29 +376,56 @@ async function main(): Promise<void> {
 
   /* -------- 交互 REPL 模式 -------- */
 
-  // 把主 readline 的提问函数注入权限层，避免双监听冲突
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-  setAskQuestion((q) => rl.question(q));
+  /**
+   * 输入源：交互终端用 readline 一行行问；非交互（`nh < script.txt`、管道）
+   * 则把 stdin 一次性读完，按行当 REPL 输入依次处理。
+   *
+   * 为什么不能统一用 readline：管道输入会在数据写完后**立刻**触发 close，
+   * 后续 question() 抛 ERR_USE_AFTER_CLOSE，缓冲里的第 2 行之后就全丢了——
+   * 表现是"喂了脚本却什么都没执行"。批处理模式既修了这个，也让 CLI 可脚本化。
+   */
+  const interactiveInput = Boolean(stdin.isTTY);
+  const batchLines: string[] = [];
+  let rl: readline.Interface | null = null;
+
+  if (interactiveInput) {
+    rl = readline.createInterface({ input: stdin, output: stdout });
+    // 把主 readline 的提问函数注入权限层，避免双监听冲突
+    setAskQuestion((q) => rl!.question(q));
+    askLine = (q) => rl!.question(q);
+    // Ctrl+C 优雅退出：readline 的 SIGINT 由 close 事件接住
+    rl.on('close', () => {
+      console.log(C.gray('\n  再见！（会话已自动保存，下次 /resume 可继续）'));
+      process.exit(0);
+    });
+  } else {
+    // 非交互：非 TTY 时 confirm() 会直接拒绝危险操作（见 permission.ts）
+    batchLines.push(...(await readBatchLines()) ?? []);
+  }
+
+  /** 取下一行输入；返回 null 表示输入结束 */
+  const nextInput = async (): Promise<string | null> => {
+    if (!interactiveInput) return batchLines.shift() ?? null;
+    try {
+      return await rl!.question(C.cyan('❯ '));
+    } catch {
+      return null;
+    }
+  };
 
   /** 对话历史：REPL 内跨轮次共享，这就是"多轮记忆"的本体 */
   const messages: ChatMessage[] = [];
+  /** 当前会话文件名：首轮保存后固定，之后每轮更新同一个文件（否则 /sessions 里全是碎片） */
+  let sessionFile: string | undefined;
   const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo, onEvent: makeTerminalSubscriber() };
 
   banner(cfg.model, workspace, cfg.yolo);
 
-  // Ctrl+C 优雅退出：readline 的 SIGINT 由 close 事件接住
-  rl.on('close', () => {
-    console.log(C.gray('\n  再见！（会话已自动保存，下次 /resume 可继续）'));
-    process.exit(0);
-  });
-
   for (;;) {
     let input: string;
-    try {
-      input = (await rl.question(C.cyan('❯ '))).trim();
-    } catch {
-      break; // stdin 关闭（如 Ctrl+D）
-    }
+    const raw = await nextInput();
+    if (raw === null) break;           // stdin 关闭（Ctrl+D / 脚本读完）
+    input = raw.trim();
     if (!input) continue;
 
     if (input.startsWith('/')) {
@@ -360,7 +441,8 @@ async function main(): Promise<void> {
     try {
       const { answer, messages: updated } = await runAgentTurn(messages, input, loopOpts);
       printAnswer(answer);
-      await saveSession(updated); // 每轮自动落盘：任何时候退出都不丢对话
+      // 每轮自动落盘：任何时候退出都不丢对话（更新同一个文件，并记下工作区）
+      sessionFile = await saveSession(updated, sessionFile, workspace);
     } catch (err) {
       console.error(C.red(`\n  ✗ ${(err as Error).message}`));
       console.error(C.gray('  提示：检查网络、API Key 与 base_url 配置（/model 查看，或编辑 ~/.nano-harness/config.json）'));
