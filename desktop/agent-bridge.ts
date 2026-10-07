@@ -14,6 +14,7 @@
 import { ipcMain, shell, dialog } from 'electron';
 import { runAgentTurn, type AgentEvent } from '../dist/loop.js';
 import type { ChatMessage } from '../dist/llm.js';
+import { homedir } from 'node:os';
 import { loadConfig, saveConfig, getActiveProvider, CONFIG_FILE, type HarnessConfig, type ModelProvider, type AgentPreset } from '../dist/config.js';
 import { saveSession, listSessions, loadSession, setSessionArchived } from '../dist/session.js';
 import { registerBuiltinTools, listTools } from '../dist/tools/index.js';
@@ -23,6 +24,13 @@ import {
   setPluginEnabled, listInstalled, PLUGINS_DIR,
 } from '../dist/plugins.js';
 import { callChat } from '../dist/llm.js';
+
+/**
+ * 默认工作区：从 Finder/Dock 启动时 process.cwd() 是 "/"，
+ * 把它当工作区既难看（侧栏显示 /）又危险（bash 会在根目录执行命令），
+ * 所以这种情况回落到用户主目录。
+ */
+const DEFAULT_WORKSPACE = process.cwd() === '/' ? homedir() : process.cwd();
 
 /** 广播函数类型：主进程 → 渲染层的事件通道 */
 type Broadcast = (payload: AgentEvent | { type: 'permission_request'; id: number } & PermissionRequest) => void;
@@ -68,7 +76,7 @@ export function createAgentBridge(broadcast: Broadcast): void {
     try {
       const result = await runAgentTurn(messages, task, {
         cfg,
-        workspace: opts?.workspace ?? process.cwd(), // composer 的工作区 pill 可覆盖
+        workspace: opts?.workspace ?? DEFAULT_WORKSPACE, // composer 的工作区 pill 可覆盖
         preset: opts?.preset ?? cfg.activePreset,    // composer 的预设 pill 可覆盖
         yolo: cfg.yolo,
         onEvent: (evt) => broadcast(evt),
@@ -199,7 +207,7 @@ export function createAgentBridge(broadcast: Broadcast): void {
     const res = await dialog.showOpenDialog({
       properties: ['openDirectory', 'createDirectory'],
       title: '选择工作区目录',
-      defaultPath: process.cwd(),
+      defaultPath: DEFAULT_WORKSPACE,
     });
     if (res.canceled || res.filePaths.length === 0) return { ok: false };
     return { ok: true, path: res.filePaths[0] };
@@ -239,7 +247,7 @@ export function createAgentBridge(broadcast: Broadcast): void {
     return { ok: true };
   });
   // 应用信息（侧栏展示工作区名）
-  ipcMain.handle('app:info', () => ({ workspace: process.cwd(), version: '0.3.0' }));
+  ipcMain.handle('app:info', () => ({ workspace: DEFAULT_WORKSPACE, version: '0.3.0' }));
   // 设置弹窗"打开配置文件"：在 Finder 中定位 config.json
   ipcMain.handle('config:reveal', () => {
     shell.showItemInFolder(CONFIG_FILE);

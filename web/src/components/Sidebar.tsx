@@ -115,8 +115,8 @@ export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings
           </div>
         )}
         {shown.map((s) => (
-          <button key={s.file} className="session-item indented" onClick={() => openSession(s.file)} title={s.title}>
-            <span style={s.archived ? { opacity: 0.6 } : undefined}>{s.title}</span>
+          <button key={s.file} className="session-item indented" onClick={() => openSession(s.file)}>
+            <span className="s-title" style={s.archived ? { opacity: 0.6 } : undefined}>{s.title}</span>
             <span
               className="archive-btn"
               role="button"
