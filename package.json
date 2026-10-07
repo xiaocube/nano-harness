@@ -1,0 +1,43 @@
+{
+  "name": "nano-harness",
+  "version": "0.1.0",
+  "description": "零依赖、模块化的终端 AI Agent Harness —— Agent = Model + Harness 的最小完整实现",
+  "type": "module",
+  "main": "dist/cli.js",
+  "bin": {
+    "nh": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "mock": "node scripts/mock-server.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "harness",
+    "llm",
+    "cli",
+    "openai-compatible",
+    "deepseek",
+    "zhipu",
+    "ollama"
+  ],
+  "author": "xiaocube",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
