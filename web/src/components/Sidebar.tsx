@@ -13,13 +13,15 @@ import { api, type SessionInfo } from '../api.js';
 import { ZapIcon, PuzzleIcon, SettingsIcon, PlusIcon, FolderIcon } from './icons.js';
 
 interface Props {
-  page: 'chat' | 'plugins' | 'settings';
-  onNavigate: (page: 'chat' | 'plugins' | 'settings') => void;
+  page: 'chat' | 'plugins';
+  settingsOpen: boolean;
+  onNavigate: (page: 'chat' | 'plugins') => void;
+  onOpenSettings: () => void;
   sessionTick: number;
   onOpenSession: () => void;
 }
 
-export default function Sidebar({ page, onNavigate, sessionTick, onOpenSession }: Props) {
+export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings, sessionTick, onOpenSession }: Props) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [workspace, setWorkspace] = useState('…');
 
@@ -84,8 +86,8 @@ export default function Sidebar({ page, onNavigate, sessionTick, onOpenSession }
 
       <div className="sidebar-footer" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
         <button
-          className={`nav-item${page === 'settings' ? ' active' : ''}`}
-          onClick={() => onNavigate('settings')}
+          className={`nav-item${settingsOpen ? ' active' : ''}`}
+          onClick={onOpenSettings}
         >
           <SettingsIcon /> 设置
         </button>

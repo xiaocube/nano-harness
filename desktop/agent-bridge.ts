@@ -22,6 +22,7 @@ import {
   loadInstalledPlugins, fetchMarketplace, installFromEntry, uninstallPlugin,
   setPluginEnabled, listInstalled, PLUGINS_DIR,
 } from '../dist/plugins.js';
+import { CONFIG_FILE } from '../dist/config.js';
 import { callChat } from '../dist/llm.js';
 
 /** 广播函数类型：主进程 → 渲染层的事件通道 */
@@ -153,4 +154,9 @@ export function createAgentBridge(broadcast: Broadcast): void {
   });
   // 应用信息（侧栏展示工作区名）
   ipcMain.handle('app:info', () => ({ workspace: process.cwd(), version: '0.2.0' }));
+  // 设置弹窗"打开配置文件"：在 Finder 中定位 config.json
+  ipcMain.handle('config:reveal', () => {
+    shell.showItemInFolder(CONFIG_FILE);
+    return { ok: true };
+  });
 }

@@ -66,6 +66,7 @@ export interface NanoharnessAPI {
   getConfig(): Promise<HarnessConfig>;
   setConfig(partial: Partial<HarnessConfig>): Promise<{ ok: boolean }>;
   testConnection(): Promise<{ ok: boolean; message: string }>;
+  revealConfigFile(): Promise<{ ok: boolean }>;
   getTheme(): Promise<{ dark: boolean }>;
   setTheme(mode: 'system' | 'light' | 'dark'): Promise<{ dark: boolean }>;
   onThemeChanged(callback: (payload: { dark: boolean }) => void): () => void;
@@ -152,6 +153,7 @@ function createMockAPI(): NanoharnessAPI {
     async getConfig() { return { ...store.config }; },
     async setConfig(partial) { store.config = { ...store.config, ...partial }; return { ok: true }; },
     async testConnection() { return { ok: true, message: '（Mock）连接成功' }; },
+    async revealConfigFile() { return { ok: true }; },
     async getTheme() { return { dark: window.matchMedia('(prefers-color-scheme: dark)').matches }; },
     async setTheme(mode) {
       const dark = mode === 'dark' || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);

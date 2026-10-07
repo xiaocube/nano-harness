@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('nanoharness', {
   getConfig: () => ipcRenderer.invoke('config:get'),
   setConfig: (partial: Record<string, unknown>) => ipcRenderer.invoke('config:set', partial),
   testConnection: () => ipcRenderer.invoke('config:test'),
+  revealConfigFile: () => ipcRenderer.invoke('config:reveal'),
 
   /* ---------- 主题 ---------- */
   getTheme: () => ipcRenderer.invoke('theme:get'),
