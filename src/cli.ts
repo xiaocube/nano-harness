@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { C, banner, printAnswer, startSpinner, printToolCall, printToolResult, printUsage } from './ui.js';
-import { loadConfig, saveConfig, configExists, isConfigUsable, PRESETS, type HarnessConfig } from './config.js';
+import { loadConfig, saveConfig, configExists, isConfigUsable, getActiveProvider, PRESETS, type HarnessConfig } from './config.js';
 import { registerBuiltinTools, listTools } from './tools/index.js';
 import { runAgentTurn, type LoopOptions, type AgentEvent } from './loop.js';
 import { setAskQuestion } from './permission.js';
@@ -24,7 +24,7 @@ import { saveSession, listSessions, loadSession } from './session.js';
 import { loadInstalledPlugins } from './plugins.js';
 import type { ChatMessage } from './llm.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 /**
  * 把核心事件翻译成终端渲染——CLI 是核心事件的第一个订阅者。
@@ -270,6 +270,16 @@ async function main(): Promise<void> {
   if (values['api-key']) cfg.apiKey = values['api-key'];
   if (values.model) cfg.model = values.model;
   cfg.yolo = values.yolo || cfg.yolo;
+  // v0.3 多提供商：CLI 临时参数必须同步进"当前提供商"，
+  // 否则 callChat 走 getActiveProvider 会绕过 --base-url/--api-key/--model
+  {
+    const active = getActiveProvider(cfg);
+    if (values['base-url']) active.baseUrl = values['base-url'];
+    if (values['api-key']) active.apiKey = values['api-key'];
+    if (values.model) active.model = values.model;
+    cfg.providers = [active, ...(cfg.providers ?? []).filter((x) => x.id !== active.id)];
+    cfg.activeProviderId = active.id;
+  }
 
   // 首启判断：仅在"既没有命令行临时配置、配置也不可用"时才走向导。
   // （一次性任务模式用 --base-url/--api-key 直跑时不应被向导拦住）

@@ -20,12 +20,66 @@
  */
 
 import type { ChatMessage, ToolCall } from './llm.js';
-import type { HarnessConfig } from './config.js';
+import type { HarnessConfig, AgentPreset } from './config.js';
 import { callChat } from './llm.js';
-import { getTool, toOpenAITools, type ToolContext } from './tools/index.js';
+import { getTool, listTools, type ToolContext } from './tools/index.js';
 import { confirm } from './permission.js';
 import { maybeCompact } from './context.js';
 import { previewForPermission } from './tools/fs-tools.js';
+
+/**
+ * Agent 预设：不同任务形态用不同的"人设 + 工具面"。
+ * 与 dsh 的模式设计同源——标准覆盖日常，极简控制成本与噪声，创造面向扩展 harness 自身。
+ */
+export const PRESET_DEFS: Record<AgentPreset, {
+  label: string; description: string; tools: string[] | null; system: (ws: string) => string;
+}> = {
+  standard: {
+    label: '标准模式',
+    description: '处理代码、文件和资料，适合大多数任务。使用全部工具。',
+    tools: null, // null = 全部可用工具（含插件）
+    system: (ws) => [
+      '你是运行在 nano-harness 里的智能体。',
+      `当前工作目录：${ws}`,
+      '',
+      '你可以调用工具读取/写入/编辑文件、查看目录、执行 bash 命令。',
+      '',
+      '工作准则：',
+      '1. 先看再改：修改文件前先用 read_file 查看现状，用 list_dir 了解结构。',
+      '2. 最小改动：只做与任务直接相关的修改，不顺手重构。',
+      '3. 简洁汇报：回答用简体中文，直接给结论和关键信息。',
+      '4. 面对错误：工具报错时阅读错误信息、调整方案重试，而不是放弃。',
+      '5. 明确收尾：任务完成后简要说明做了什么、结果如何。',
+    ].join('\n'),
+  },
+  minimal: {
+    label: '极简模式',
+    description: '仅使用只读工具快速回答，适合查询、对比和基础测试。',
+    tools: ['read_file', 'list_dir'],
+    system: (ws) => [
+      '你是运行在 nano-harness 里的智能体（极简模式）。',
+      `当前工作目录：${ws}`,
+      '',
+      '你只有只读能力（读文件、看目录），不能修改任何东西。',
+      '回答追求快、准、短：直接给结论，必要时引用文件路径。',
+    ].join('\n'),
+  },
+  creative: {
+    label: '创造模式',
+    description: '面向定制 nano-harness：让 Agent 编写插件，添加新能力和工具。',
+    tools: null,
+    system: (ws) => [
+      '你是运行在 nano-harness 里的智能体（创造模式）。',
+      `当前工作目录：${ws}`,
+      '',
+      '你的特殊使命：当任务缺少趁手的工具时，主动提出并动手为用户编写插件来扩展 harness——',
+      '插件是一个文件夹：plugin.json（name/version/description/author）+ tools.mjs（默认导出 { tools: [...] }），',
+      '放入 ~/.nano-harness/plugins/<名字>/ 后重启应用生效。参考 examples/plugins/devtools 的写法。',
+      '',
+      '其余准则与标准模式一致：先看再改、最小改动、简洁汇报、面对错误自愈、明确收尾。',
+    ].join('\n'),
+  },
+};
 
 /**
  * Agent 循环过程中对外发射的全部事件。
@@ -68,12 +122,14 @@ function buildSystemPrompt(workspace: string): string {
 
 /** 一次 agent 回合的运行参数 */
 export interface LoopOptions {
-  /** 当前配置（maxSteps / contextChars / 模型信息都从这里来） */
+  /** 当前配置（maxSteps / contextChars / 提供商都从这里来） */
   cfg: HarnessConfig;
   /** 工作区根目录（也是工具的路径安全边界） */
   workspace: string;
   /** YOLO 模式：跳过权限确认 */
   yolo: boolean;
+  /** Agent 预设（缺省 standard）：决定系统提示词与工具白名单 */
+  preset?: AgentPreset;
   /** 事件订阅者：终端打印、桌面渲染、日志收集都从这里接 */
   onEvent?: (evt: AgentEvent) => void;
 }
@@ -101,15 +157,22 @@ export async function runAgentTurn(
   const toolCtx: ToolContext = { workspace: opts.workspace, cfg: opts.cfg };
   const emit = (evt: AgentEvent) => opts.onEvent?.(evt);
   const maxSteps = opts.cfg.maxSteps;
+  const presetDef = PRESET_DEFS[opts.preset ?? 'standard'];
 
-  // 历史为空说明是新会话：先放系统提示词
+  // 历史为空说明是新会话：先放系统提示词（随预设变化）
   if (messages.length === 0) {
-    messages.push({ role: 'system', content: buildSystemPrompt(opts.workspace) });
+    messages.push({ role: 'system', content: presetDef.system(opts.workspace) });
   }
   // 用户任务入栈——这就是模型看到的"需求"
   messages.push({ role: 'user', content: task });
 
-  const tools = toOpenAITools();
+  // 工具面按预设过滤：极简模式只暴露白名单内的工具（含启用的插件工具）
+  const tools = listTools()
+    .filter((t) => !presetDef.tools || presetDef.tools.includes(t.name))
+    .map((t) => ({
+      type: 'function' as const,
+      function: { name: t.name, description: t.description, parameters: t.parameters },
+    }));
 
   for (let step = 1; step <= maxSteps; step++) {
     // 历史太长先压缩：压缩也调一次模型，但换来"无限长对话"的能力
@@ -152,7 +215,7 @@ export async function runAgentTurn(
 
       // ④-1 工具不存在：把错误作为"工具结果"回传，模型会自己纠正
       if (!tool) {
-        const available = toOpenAITools().map((t) => t.function.name).join(', ');
+        const available = tools.map((t) => t.function.name).join(', ');
         messages.push({
           role: 'tool',
           tool_call_id: call.id,

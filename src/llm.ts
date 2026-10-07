@@ -11,7 +11,7 @@
  * 零依赖设计：Node 18+ 内置全局 fetch，不需要 openai 官方 SDK。
  */
 
-import type { HarnessConfig } from './config.js';
+import { getActiveProvider, type HarnessConfig } from './config.js';
 
 /* ---------- 协议类型定义（与 OpenAI chat completions 对齐） ---------- */
 
@@ -91,10 +91,12 @@ export async function callChat(
   tools: OpenAITool[],
   retries = 2,
 ): Promise<ChatResult> {
-  const url = joinUrl(cfg.baseUrl, 'chat/completions');
+  // 多提供商：实际请求参数取"当前激活的提供商"，而不是配置文件顶层字段
+  const provider = getActiveProvider(cfg);
+  const url = joinUrl(provider.baseUrl, 'chat/completions');
   // 请求体：模型无状态，所以每次都带上完整历史与工具清单
   const body: Record<string, unknown> = {
-    model: cfg.model,
+    model: provider.model,
     messages,
     temperature: 0.7,
   };
@@ -109,7 +111,7 @@ export async function callChat(
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       // 本地模型（Ollama/mock）可以没有 Key，此时不带 Authorization 头
-      if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
+      if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
 
       const res = await fetch(url, {
         method: 'POST',

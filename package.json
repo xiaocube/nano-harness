@@ -1,6 +1,6 @@
 {
   "name": "nano-harness",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "零依赖、模块化的 AI Agent Harness —— 终端 CLI + macOS 桌面应用 + 插件市场",
   "type": "module",
   "main": "dist/cli.js",

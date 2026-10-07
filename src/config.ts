@@ -15,6 +15,18 @@ import { promises as fs } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+/** 一个模型提供商（OpenAI 兼容端点 + 凭据 + 默认模型） */
+export interface ModelProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+/** Agent 预设：决定系统提示词与可用工具白名单 */
+export type AgentPreset = 'standard' | 'minimal' | 'creative';
+
 /** harness 运行所需的全部配置 */
 export interface HarnessConfig {
   /** OpenAI 兼容 API 的根地址（不含 /chat/completions，llm.ts 会自动拼接） */
@@ -23,6 +35,15 @@ export interface HarnessConfig {
   apiKey: string;
   /** 模型名，如 deepseek-chat / glm-4-flash / qwen3:8b */
   model: string;
+  /**
+   * 模型提供商列表（v0.3 起）。为空时由 baseUrl/apiKey/model 自动迁移生成，
+   * 这三个旧字段保留为"第一个提供商"的镜像，旧配置无缝升级。
+   */
+  providers?: ModelProvider[];
+  /** 当前使用的提供商 id */
+  activeProviderId?: string;
+  /** 当前 Agent 预设（默认 standard） */
+  activePreset?: AgentPreset;
   /** Agent Loop 最大步数（防止模型无限循环烧 token） */
   maxSteps: number;
   /** YOLO 模式：true 时跳过所有危险操作确认（仅建议在容器/沙箱里开） */
@@ -33,6 +54,14 @@ export interface HarnessConfig {
   appearance?: 'system' | 'light' | 'dark';
   /** 插件启用状态表：缺省视为启用，{ "名字": false } 表示禁用 */
   plugins?: Record<string, boolean>;
+}
+
+/** 取当前生效的提供商（找不到 active 时回落第一个，再回落旧字段） */
+export function getActiveProvider(cfg: HarnessConfig): ModelProvider {
+  const list = cfg.providers ?? [];
+  const active = list.find((p) => p.id === cfg.activeProviderId) ?? list[0];
+  if (active) return active;
+  return { id: 'default', name: '默认提供商', baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: cfg.model };
 }
 
 /** 配置目录：~/.nano-harness/（配置文件、会话记录都放这里） */
@@ -120,15 +149,32 @@ export async function loadConfig(): Promise<HarnessConfig> {
     if (raw.plugins && typeof raw.plugins === 'object' && !Array.isArray(raw.plugins)) {
       cfg.plugins = raw.plugins;
     }
+    // 提供商列表与激活项（v0.3 多提供商）
+    if (Array.isArray(raw.providers) && raw.providers.length > 0) {
+      cfg.providers = raw.providers.filter(
+        (p) => p && typeof p.id === 'string' && typeof p.baseUrl === 'string',
+      );
+      cfg.activeProviderId =
+        typeof raw.activeProviderId === 'string' ? raw.activeProviderId : cfg.providers[0]?.id;
+    }
+    if (raw.activePreset === 'standard' || raw.activePreset === 'minimal' || raw.activePreset === 'creative') {
+      cfg.activePreset = raw.activePreset;
+    }
   } catch {
     // 首次运行或文件损坏：用默认值，不报错
   }
   // ② 环境变量覆盖（CI/服务器常用，避免把密钥写进文件）
-  if (process.env.NANO_HARNESS_BASE_URL) cfg.baseUrl = process.env.NANO_HARNESS_BASE_URL;
-  if (process.env.NANO_HARNESS_API_KEY) cfg.apiKey = process.env.NANO_HARNESS_API_KEY;
-  if (process.env.NANO_HARNESS_MODEL) cfg.model = process.env.NANO_HARNESS_MODEL;
-  return cfg;
-}
+    if (process.env.NANO_HARNESS_BASE_URL) cfg.baseUrl = process.env.NANO_HARNESS_BASE_URL;
+    if (process.env.NANO_HARNESS_API_KEY) cfg.apiKey = process.env.NANO_HARNESS_API_KEY;
+    if (process.env.NANO_HARNESS_MODEL) cfg.model = process.env.NANO_HARNESS_MODEL;
+    // 旧配置自动迁移：没有提供商列表时，把 baseUrl/apiKey/model 打包成第一个提供商。
+    // 环境变量覆盖的值也一并迁入，保证 NANO_HARNESS_* 用法不失效。
+    if (!cfg.providers || cfg.providers.length === 0) {
+      cfg.providers = [{ id: 'default', name: '默认提供商', baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: cfg.model }];
+      cfg.activeProviderId = 'default';
+    }
+    return cfg;
+  }
 
 /** 保存配置（首启向导、/model 命令都会调用） */
 export async function saveConfig(cfg: HarnessConfig): Promise<void> {

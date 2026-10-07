@@ -18,6 +18,14 @@ body {
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
+/* impeccable craft-floor：浏览器默认件也要带上设计——选中、光标、滚动条、标题字距 */
+::selection { background: var(--selection-bg); }
+input, textarea { caret-color: var(--accent); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 4px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--fg-secondary); }
+::-webkit-scrollbar-track { background: transparent; }
+h1, h2, h3 { letter-spacing: -0.2px; }
 button, input, textarea, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
@@ -364,6 +372,80 @@ code, .mono { font-family: var(--font-mono); font-size: 12.5px; }
 }
 .appear-card:hover { border-color: var(--fg-secondary); }
 .appear-card.active { border-color: var(--accent); background: var(--accent-tint); color: var(--accent); font-weight: 600; }
+
+/* 提供商卡片与预设卡片（设置弹窗内） */
+.provider-card {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 14px; margin-bottom: 10px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius-card); box-shadow: var(--shadow-card);
+}
+.provider-card.active { border-color: var(--accent); }
+.provider-form {
+  border: 1px solid var(--border); border-radius: var(--radius-card);
+  padding: 14px 16px; margin-bottom: 10px; background: var(--muted);
+}
+.provider-form .field { margin-bottom: 10px; }
+.dashed-add {
+  width: 100%; padding: 12px; display: flex; align-items: center; justify-content: center; gap: 6px;
+  border: 1.5px dashed var(--border); border-radius: var(--radius-card);
+  background: none; color: var(--fg-secondary); font-size: 13px;
+  transition: border-color var(--t-fast), color var(--t-fast);
+}
+.dashed-add:hover { border-color: var(--accent); color: var(--accent); }
+.preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.preset-card {
+  text-align: left; padding: 14px 16px;
+  background: var(--card); border: 1.5px solid var(--border);
+  border-radius: var(--radius-card);
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.preset-card:hover { border-color: var(--fg-secondary); }
+.preset-card.active { border-color: var(--accent); background: var(--accent-tint); }
+.preset-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.preset-card-head strong { font-size: 13.5px; }
+
+/* Composer pills：工作区 / 预设 / 当前模型 */
+.composer-pills {
+  display: flex; align-items: center; gap: 8px;
+  max-width: 760px; margin: 0 auto 8px; width: 100%;
+  font-size: 12px;
+}
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 20px;
+  border: 1px solid var(--border); background: var(--card); color: var(--fg-secondary);
+  transition: border-color var(--t-fast), color var(--t-fast);
+}
+.pill:hover { border-color: var(--accent); color: var(--accent); }
+.pill-static { border-color: transparent; background: none; padding-left: 0; }
+.pill-static:hover { border-color: transparent; color: var(--fg-secondary); }
+.pill-menu { position: relative; }
+.pill-popover {
+  position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 50;
+  min-width: 190px; padding: 5px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: var(--shadow-sheet);
+}
+.pill-popover button {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 7px 10px; border: none; background: none; text-align: left;
+  font-size: 12.5px; color: var(--fg); border-radius: 6px;
+}
+.pill-popover button:hover { background: var(--accent-tint); }
+.pill-popover .check { margin-left: auto; color: var(--accent); }
+
+/* 侧栏搜索 + 归档筛选 */
+.sidebar-tools { display: flex; gap: 5px; align-items: center; padding: 0 2px 6px; }
+.sidebar-tools .input { padding: 4px 8px; font-size: 12px; border-radius: 6px; }
+.session-item .archive-btn {
+  display: none; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  border: none; background: none; color: var(--fg-secondary); padding: 2px;
+}
+.session-item { position: relative; }
+.session-item:hover .archive-btn { display: block; }
+.session-item .archive-btn:hover { color: var(--accent); }
+.icon-btn.filtered { color: var(--accent); border-color: var(--accent); }
 
 /* ============ 权限弹窗（macOS sheet 质感） ============ */
 .overlay {

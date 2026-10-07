@@ -9,8 +9,13 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { api, type AgentEventPayload, type PermissionPayload } from '../api.js';
-import { SendIcon, ZapIcon, TerminalIcon, ShieldIcon, CheckIcon, XIcon, ChevronDownIcon } from './icons.js';
+import { api, type AgentEventPayload, type PermissionPayload, type AgentPreset } from '../api.js';
+import { SendIcon, ZapIcon, TerminalIcon, ShieldIcon, CheckIcon, XIcon, ChevronDownIcon, FolderIcon, SparkIcon } from './icons.js';
+
+/** 预设 pill 的展示文案（与核心 PRESET_DEFS 对齐） */
+const PRESET_LABELS: Record<AgentPreset, string> = {
+  standard: '标准模式', minimal: '极简模式', creative: '创造模式',
+};
 
 /** 消息流里的一条渲染项 */
 type ChatItem =
@@ -32,6 +37,11 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
   const [permission, setPermission] = useState<PermissionPayload | null>(null);
   const [expandedTool, setExpandedTool] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  /** Composer pills：工作区 / 预设 / 当前模型名 */
+  const [workspace, setWorkspace] = useState('…');
+  const [preset, setPreset] = useState<AgentPreset>('standard');
+  const [modelName, setModelName] = useState('');
+  const [presetMenu, setPresetMenu] = useState(false);
 
   // 订阅核心事件 → 更新消息流
   useEffect(() => {
@@ -103,6 +113,19 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
     return () => window.removeEventListener('session-loaded', reload as EventListener);
   }, []);
 
+  // Composer pills 初始化：工作区 / 预设 / 当前模型名
+  useEffect(() => {
+    void api.getAppInfo().then((info) => {
+      const parts = info.workspace.split('/');
+      setWorkspace(parts[parts.length - 1] || info.workspace);
+    }).catch(() => setWorkspace('工作区'));
+    void api.getConfig().then((cfg) => {
+      setPreset(cfg.activePreset ?? 'standard');
+      const p = (cfg.providers ?? []).find((x) => x.id === cfg.activeProviderId) ?? cfg.providers?.[0];
+      setModelName(p?.model ?? cfg.model);
+    }).catch(() => {});
+  }, []);
+
   // 消息流自动滚到底
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -114,7 +137,8 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
     setItems((xs) => [...xs, { kind: 'user', text: trimmed }]);
     setInput('');
     setRunning(true);
-    const res = await api.send(trimmed);
+    // 把 pills 的选择带给核心：工作区决定文件边界，预设决定人设与工具面
+    const res = await api.send(trimmed, { workspace, preset });
     if (!res.ok && res.error) {
       setItems((xs) => [...xs, { kind: 'notice', text: `出错了：${res.error}` }]);
       setRunning(false);
@@ -191,6 +215,41 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
             ))}
           </div>
         )}
+        <div className="composer-pills">
+          <button
+            className="pill"
+            title="选择本轮任务的工作区目录"
+            onClick={async () => {
+              const res = await api.chooseWorkspace();
+              if (res.ok && res.path) {
+                const parts = res.path.split('/');
+                setWorkspace(parts[parts.length - 1] || res.path);
+              }
+            }}
+          >
+            <FolderIcon size={12} /> {workspace} <ChevronDownIcon size={11} />
+          </button>
+          <div className="pill-menu">
+            <button className="pill" onClick={() => setPresetMenu((v) => !v)}>
+              <SparkIcon size={12} /> {PRESET_LABELS[preset]} <ChevronDownIcon size={11} />
+            </button>
+            {presetMenu && (
+              <div className="pill-popover">
+                {(Object.keys(PRESET_LABELS) as AgentPreset[]).map((k) => (
+                  <button key={k} onClick={async () => {
+                    setPreset(k);
+                    setPresetMenu(false);
+                    await api.setPreset(k); // 持久化，新对话默认沿用
+                  }}>
+                    {PRESET_LABELS[k]}
+                    {preset === k && <span className="check"><CheckIcon size={13} /></span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <span className="pill pill-static" style={{ marginLeft: 'auto' }}>{modelName}</span>
+        </div>
         <div className="composer-box">
           <textarea
             value={input}

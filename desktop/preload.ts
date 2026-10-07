@@ -28,14 +28,25 @@ contextBridge.exposeInMainWorld('nanoharness', {
   onAgentEvent: (callback: (payload: unknown) => void) => subscribe('agent:event', callback),
 
   /* ---------- 会话 ---------- */
-  listSessions: () => ipcRenderer.invoke('session:list'),
+  listSessions: (archiveFilter?: 'hide' | 'all' | 'only') => ipcRenderer.invoke('session:list', archiveFilter),
   loadSession: (file: string) => ipcRenderer.invoke('session:load', file),
+  archiveSession: (file: string, archived: boolean) => ipcRenderer.invoke('session:archive', file, archived),
 
   /* ---------- 配置 ---------- */
   getConfig: () => ipcRenderer.invoke('config:get'),
   setConfig: (partial: Record<string, unknown>) => ipcRenderer.invoke('config:set', partial),
-  testConnection: () => ipcRenderer.invoke('config:test'),
+  testConnection: (providerId?: string) => ipcRenderer.invoke('config:test', providerId),
   revealConfigFile: () => ipcRenderer.invoke('config:reveal'),
+
+  /* ---------- 模型提供商 ---------- */
+  saveProvider: (provider: unknown) => ipcRenderer.invoke('provider:save', provider),
+  deleteProvider: (id: string) => ipcRenderer.invoke('provider:delete', id),
+  setActiveProvider: (id: string) => ipcRenderer.invoke('provider:set-active', id),
+  queryBalance: (id: string) => ipcRenderer.invoke('provider:balance', id),
+
+  /* ---------- 预设与工作区 ---------- */
+  setPreset: (preset: string) => ipcRenderer.invoke('preset:set', preset),
+  chooseWorkspace: () => ipcRenderer.invoke('workspace:choose'),
 
   /* ---------- 主题 ---------- */
   getTheme: () => ipcRenderer.invoke('theme:get'),

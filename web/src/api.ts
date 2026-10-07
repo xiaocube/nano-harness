@@ -9,17 +9,36 @@
 
 /* ---------- 与主进程对齐的类型 ---------- */
 
+export interface ModelProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+export type AgentPreset = 'standard' | 'minimal' | 'creative';
+
 export interface HarnessConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  providers?: ModelProvider[];
+  activeProviderId?: string;
+  activePreset?: AgentPreset;
   maxSteps: number;
   yolo: boolean;
   contextChars: number;
   appearance?: 'system' | 'light' | 'dark';
 }
 
-export interface SessionInfo { file: string; title: string; createdAt: string }
+export interface SessionInfo {
+  file: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  archived: boolean;
+}
 
 export interface ChatMessage { role: 'user' | 'assistant' | 'system' | 'tool'; content: string }
 
@@ -56,17 +75,24 @@ export type AgentEventPayload =
 
 /** preload 暴露的 API 形状（desktop/preload.ts 的对偶） */
 export interface NanoharnessAPI {
-  send(task: string): Promise<{ ok: boolean; answer?: string; error?: string }>;
+  send(task: string, opts?: { workspace?: string; preset?: AgentPreset }): Promise<{ ok: boolean; answer?: string; error?: string }>;
   newChat(): Promise<{ ok: boolean }>;
   currentMessages(): Promise<{ ok: boolean; messages: ChatMessage[] }>;
   replyPermission(id: number, allowed: boolean): void;
   onAgentEvent(callback: (payload: AgentEventPayload) => void): () => void;
-  listSessions(): Promise<SessionInfo[]>;
+  listSessions(archiveFilter?: 'hide' | 'all' | 'only'): Promise<SessionInfo[]>;
   loadSession(file: string): Promise<{ ok: boolean; messages: ChatMessage[] }>;
+  archiveSession(file: string, archived: boolean): Promise<{ ok: boolean }>;
   getConfig(): Promise<HarnessConfig>;
   setConfig(partial: Partial<HarnessConfig>): Promise<{ ok: boolean }>;
-  testConnection(): Promise<{ ok: boolean; message: string }>;
+  testConnection(providerId?: string): Promise<{ ok: boolean; message: string }>;
   revealConfigFile(): Promise<{ ok: boolean }>;
+  saveProvider(provider: ModelProvider): Promise<{ ok: boolean; message: string }>;
+  deleteProvider(id: string): Promise<{ ok: boolean; message: string }>;
+  setActiveProvider(id: string): Promise<{ ok: boolean; message: string }>;
+  queryBalance(id: string): Promise<{ ok: boolean; message: string }>;
+  setPreset(preset: AgentPreset): Promise<{ ok: boolean; message: string }>;
+  chooseWorkspace(): Promise<{ ok: boolean; path?: string }>;
   getTheme(): Promise<{ dark: boolean }>;
   setTheme(mode: 'system' | 'light' | 'dark'): Promise<{ dark: boolean }>;
   onThemeChanged(callback: (payload: { dark: boolean }) => void): () => void;
@@ -101,10 +127,15 @@ function createMockAPI(): NanoharnessAPI {
   const store = {
     config: {
       baseUrl: 'https://api.deepseek.com', apiKey: 'sk-mock', model: 'deepseek-chat',
+      providers: [{ id: 'default', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', apiKey: 'sk-mock', model: 'deepseek-chat' }],
+      activeProviderId: 'default',
+      activePreset: 'standard' as const,
       maxSteps: 25, yolo: false, contextChars: 48000, appearance: 'system' as const,
     } as HarnessConfig,
     installed: [] as InstalledPlugin[],
     disabledPlugins: {} as Record<string, boolean>,
+    current: [] as ChatMessage[],
+    sessions: [] as SessionInfo[],
   };
 
   return {
@@ -142,18 +173,51 @@ function createMockAPI(): NanoharnessAPI {
         : `（Mock 演示）你拒绝了写文件操作，所以我只汇报：项目结构正常。你的任务是：「${task.slice(0, 40)}」`;
       current.push({ role: 'assistant', content: answer });
       emit({ type: 'answer', answer });
+      // 让侧栏在 Mock 模式下也有会话可看（演示 updatedAt/归档）
+      const now = new Date().toISOString();
+      if (store.sessions[0]) store.sessions[0].updatedAt = now;
+      else store.sessions.unshift({ file: 'mock-session.json', title: task.slice(0, 30), createdAt: now, updatedAt: now, archived: false });
       return { ok: true, answer };
     },
     async newChat() { current = []; return { ok: true }; },
     async currentMessages() { return { ok: true, messages: [...current] }; },
     replyPermission(id: number, allowed: boolean) { void id; replyResolver?.(allowed); },
     onAgentEvent(cb) { eventListener = cb; return () => { eventListener = null; }; },
-    async listSessions() { return []; },
+    async listSessions(archiveFilter) {
+      void archiveFilter;
+      return [...store.sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    },
     async loadSession() { return { ok: true, messages: [] as ChatMessage[] }; },
+    async archiveSession(file, archived) {
+      const s = store.sessions.find((x) => x.file === file);
+      if (s) s.archived = archived;
+      return { ok: true };
+    },
     async getConfig() { return { ...store.config }; },
     async setConfig(partial) { store.config = { ...store.config, ...partial }; return { ok: true }; },
-    async testConnection() { return { ok: true, message: '（Mock）连接成功' }; },
+    async testConnection(providerId) {
+      void providerId;
+      return { ok: true, message: '（Mock）连接成功' };
+    },
     async revealConfigFile() { return { ok: true }; },
+    async saveProvider(provider) {
+      const list = store.config.providers ?? [];
+      const idx = list.findIndex((p) => p.id === provider.id);
+      if (idx >= 0) list[idx] = provider; else list.push(provider);
+      store.config = { ...store.config, providers: list, activeProviderId: provider.id };
+      return { ok: true, message: `已保存「${provider.name}」（Mock）` };
+    },
+    async deleteProvider(id) {
+      store.config = { ...store.config, providers: (store.config.providers ?? []).filter((p) => p.id !== id) };
+      return { ok: true, message: '已删除（Mock）' };
+    },
+    async setActiveProvider(id) {
+      store.config = { ...store.config, activeProviderId: id };
+      return { ok: true, message: '已切换（Mock）' };
+    },
+    async queryBalance() { return { ok: true, message: '余额 ¥86.40 CNY（Mock）' }; },
+    async setPreset(preset) { store.config = { ...store.config, activePreset: preset }; return { ok: true, message: '预设已切换（Mock）' }; },
+    async chooseWorkspace() { return { ok: true, path: '/Users/demo/另一个项目' }; },
     async getTheme() { return { dark: window.matchMedia('(prefers-color-scheme: dark)').matches }; },
     async setTheme(mode) {
       const dark = mode === 'dark' || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);

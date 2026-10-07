@@ -2,15 +2,15 @@
  * Sidebar.tsx —— 毛玻璃侧栏（dsh 风格布局）
  *
  * 上：品牌
- * 主操作：新建任务（agent 的一切从这里开始）
- * 工作区分组：默认工作区 → 其下挂该工作区的历史会话
+ * 主操作：新建任务（agent 的一切从这里开始）+ 插件市场
+ * 工作区分组：搜索框 + 归档筛选（隐藏已归档/全部/仅已归档）→ 会话列表（hover 归档）
  * 底部：设置入口 + 版本
  * 会话列表由 sessionTick 驱动刷新：每完成一轮对话自动拉一次。
  */
 
 import { useEffect, useState } from 'react';
 import { api, type SessionInfo } from '../api.js';
-import { ZapIcon, PuzzleIcon, SettingsIcon, PlusIcon, FolderIcon } from './icons.js';
+import { ZapIcon, PuzzleIcon, SettingsIcon, PlusIcon, FolderIcon, SearchIcon, SlidersIcon, ArchiveIcon, CheckIcon } from './icons.js';
 
 interface Props {
   page: 'chat' | 'plugins';
@@ -21,13 +21,21 @@ interface Props {
   onOpenSession: () => void;
 }
 
+type ArchiveFilter = 'hide' | 'all' | 'only';
+const FILTER_LABELS: Record<ArchiveFilter, string> = {
+  hide: '隐藏已归档', all: '全部对话', only: '仅显示已归档',
+};
+
 export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings, sessionTick, onOpenSession }: Props) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<ArchiveFilter>('hide');
+  const [filterMenu, setFilterMenu] = useState(false);
   const [workspace, setWorkspace] = useState('…');
 
   useEffect(() => {
-    void api.listSessions().then(setSessions).catch(() => setSessions([]));
-  }, [sessionTick]);
+    void api.listSessions(filter).then(setSessions).catch(() => setSessions([]));
+  }, [sessionTick, filter]);
 
   useEffect(() => {
     void api.getAppInfo().then((info) => {
@@ -40,7 +48,6 @@ export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings
     await api.loadSession(file);
     onNavigate('chat');
     onOpenSession();
-    // 通知聊天页重绘历史（经由全局事件：聊天页监听 window 自定义事件，见 ChatPage）
     window.dispatchEvent(new CustomEvent('session-loaded'));
   };
 
@@ -49,6 +56,8 @@ export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings
     window.dispatchEvent(new CustomEvent('session-loaded'));
     onNavigate('chat');
   };
+
+  const shown = sessions.filter((s) => s.title.toLowerCase().includes(query.toLowerCase()));
 
   return (
     <aside className="sidebar">
@@ -71,15 +80,56 @@ export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings
       <div className="workspace-item">
         <FolderIcon size={14} /> {workspace}
       </div>
+      <div className="sidebar-tools">
+        <input
+          className="input"
+          style={{ flex: 1 }}
+          placeholder="搜索会话"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          aria-label="搜索会话"
+        />
+        <button
+          className={`icon-btn${filter !== 'hide' ? ' filtered' : ''}`}
+          title="筛选会话"
+          style={{ width: 26, height: 26 }}
+          onClick={() => setFilterMenu((v) => !v)}
+        >
+          <SlidersIcon size={13} />
+        </button>
+      </div>
+      {filterMenu && (
+        <div className="pill-popover" style={{ position: 'static', marginBottom: 6 }}>
+          {(['hide', 'all', 'only'] as ArchiveFilter[]).map((k) => (
+            <button key={k} onClick={() => { setFilter(k); setFilterMenu(false); }}>
+              {FILTER_LABELS[k]}
+              {filter === k && <span className="check"><CheckIcon size={13} /></span>}
+            </button>
+          ))}
+        </div>
+      )}
       <div style={{ overflowY: 'auto', flex: 1 }}>
-        {sessions.length === 0 && (
+        {shown.length === 0 && (
           <div style={{ padding: '4px 9px 4px 23px', fontSize: 12, color: 'var(--fg-secondary)' }}>
-            暂无会话
+            {query ? '没有匹配的会话' : '暂无会话'}
           </div>
         )}
-        {sessions.map((s) => (
+        {shown.map((s) => (
           <button key={s.file} className="session-item indented" onClick={() => openSession(s.file)} title={s.title}>
-            {s.title}
+            <span style={s.archived ? { opacity: 0.6 } : undefined}>{s.title}</span>
+            <span
+              className="archive-btn"
+              role="button"
+              aria-label={s.archived ? '取消归档' : '归档'}
+              title={s.archived ? '取消归档' : '归档'}
+              onClick={async (e) => {
+                e.stopPropagation();
+                await api.archiveSession(s.file, !s.archived);
+                setSessions((xs) => xs.map((x) => (x.file === s.file ? { ...x, archived: !x.archived } : x)));
+              }}
+            >
+              <ArchiveIcon size={13} />
+            </span>
           </button>
         ))}
       </div>
@@ -92,7 +142,7 @@ export default function Sidebar({ page, settingsOpen, onNavigate, onOpenSettings
           <SettingsIcon /> 设置
         </button>
         <div style={{ fontSize: 11, color: 'var(--fg-secondary)', padding: '2px 9px' }}>
-          v0.2.0 · 模型在本地终端运行
+          v0.3.0 · 模型在本地终端运行
         </div>
       </div>
     </aside>
