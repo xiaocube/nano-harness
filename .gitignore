@@ -13,3 +13,7 @@ dist/
 # ZCode 工作区状态
 .zcode/
 .zcode-share/
+
+# 桌面端与前端构建产物
+dist-desktop/
+web/dist/

@@ -29,6 +29,8 @@ export interface HarnessConfig {
   yolo: boolean;
   /** 触发上下文压缩的字符数阈值（粗略对应 ~20k token） */
   contextChars: number;
+  /** 桌面版外观：跟随系统/浅色/深色（CLI 忽略此项） */
+  appearance?: 'system' | 'light' | 'dark';
 }
 
 /** 配置目录：~/.nano-harness/（配置文件、会话记录都放这里） */
@@ -82,6 +84,7 @@ const DEFAULTS: HarnessConfig = {
   maxSteps: 25,
   yolo: false,
   contextChars: 48_000,
+  appearance: 'system',
 };
 
 /** 配置文件是否已存在（用于判断要不要跑首启向导） */
@@ -109,6 +112,9 @@ export async function loadConfig(): Promise<HarnessConfig> {
     if (typeof raw.maxSteps === 'number' && raw.maxSteps > 0) cfg.maxSteps = raw.maxSteps;
     if (typeof raw.yolo === 'boolean') cfg.yolo = raw.yolo;
     if (typeof raw.contextChars === 'number' && raw.contextChars > 0) cfg.contextChars = raw.contextChars;
+    if (raw.appearance === 'system' || raw.appearance === 'light' || raw.appearance === 'dark') {
+      cfg.appearance = raw.appearance;
+    }
   } catch {
     // 首次运行或文件损坏：用默认值，不报错
   }

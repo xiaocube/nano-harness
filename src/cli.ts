@@ -15,15 +15,52 @@ import { parseArgs } from 'node:util';
 import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
-import { C, banner, printAnswer } from './ui.js';
+import { C, banner, printAnswer, startSpinner, printToolCall, printToolResult, printUsage } from './ui.js';
 import { loadConfig, saveConfig, configExists, isConfigUsable, PRESETS, type HarnessConfig } from './config.js';
 import { registerBuiltinTools, listTools } from './tools/index.js';
-import { runAgentTurn, type LoopOptions } from './loop.js';
+import { runAgentTurn, type LoopOptions, type AgentEvent } from './loop.js';
 import { setAskQuestion } from './permission.js';
 import { saveSession, listSessions, loadSession } from './session.js';
+import { loadInstalledPlugins } from './plugins.js';
 import type { ChatMessage } from './llm.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
+
+/**
+ * 把核心事件翻译成终端渲染——CLI 是核心事件的第一个订阅者。
+ * 桌面端（Electron）会写自己的订阅者把同样的事件渲染成界面。
+ */
+function makeTerminalSubscriber(): (evt: AgentEvent) => void {
+  let spinner: { stop: (finalText?: string) => void } | null = null;
+  return (evt: AgentEvent) => {
+    switch (evt.type) {
+      case 'thinking_start':
+        spinner = startSpinner(`思考中…（第 ${evt.step}/${evt.maxSteps} 步）`);
+        break;
+      case 'thinking_end':
+        spinner?.stop();
+        spinner = null;
+        break;
+      case 'usage':
+        printUsage(evt.tokens, evt.model);
+        break;
+      case 'compacted':
+        console.log('  (上下文已压缩，较早的对话被折叠成摘要)');
+        break;
+      case 'tool_call':
+        printToolCall(evt.step, evt.maxSteps, evt.name, evt.summary);
+        break;
+      case 'tool_result':
+        printToolResult(evt.preview);
+        break;
+      case 'tool_denied':
+        console.log(C.gray(`  ↳ ${evt.name} 被用户拒绝`));
+        break;
+      case 'answer':
+        break; // 最终回答由调用方拿返回值统一渲染
+    }
+  };
+}
 
 /* ---------------- 帮助文本 ---------------- */
 
@@ -130,6 +167,19 @@ async function handleCommand(
       }
       return 'handled';
 
+    case '/plugins': {
+      const plugins = await loadInstalledPlugins(false);
+      if (plugins.length === 0) {
+        console.log(C.gray('  未安装任何插件。插件目录：~/.nano-harness/plugins/'));
+      } else {
+        for (const p of plugins) {
+          const info = p.loadError ? C.red(`加载失败: ${p.loadError}`) : C.gray(`工具: ${p.toolNames.join(', ') || '无'}`);
+          console.log(`  ${C.cyan(p.manifest.name)} v${p.manifest.version}  ${info}`);
+        }
+      }
+      return 'handled';
+    }
+
     case '/model': {
       if (!arg) {
         console.log(`  当前模型: ${C.bold(cfg.model)}  （用法：/model <模型名>）`);
@@ -235,6 +285,10 @@ async function main(): Promise<void> {
 
   // 登记全部内置工具（想加自定义工具？看 src/tools/index.ts 的说明）
   await registerBuiltinTools();
+  // 加载用户已安装的插件工具（~/.nano-harness/plugins/，失败不阻塞启动）
+  for (const p of await loadInstalledPlugins(true)) {
+    if (p.loadError) console.error(C.yellow(`  ⚠ 插件 ${p.manifest.name} 加载失败：${p.loadError}`));
+  }
 
   /* -------- 一次性任务模式：nh "任务描述" --------
    * 注意：此模式不创建 readline——它会把 stdin 的关闭误判为用户退出。
@@ -243,7 +297,7 @@ async function main(): Promise<void> {
   if (positionals.length > 0) {
     const task = positionals.join(' ');
     const messages: ChatMessage[] = [];
-    const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo };
+    const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo, onEvent: makeTerminalSubscriber() };
     try {
       const { answer, messages: updated } = await runAgentTurn(messages, task, loopOpts);
       printAnswer(answer);
@@ -263,7 +317,7 @@ async function main(): Promise<void> {
 
   /** 对话历史：REPL 内跨轮次共享，这就是"多轮记忆"的本体 */
   const messages: ChatMessage[] = [];
-  const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo };
+  const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo, onEvent: makeTerminalSubscriber() };
 
   banner(cfg.model, workspace, cfg.yolo);
 

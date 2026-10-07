@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "name": "devtools",
+      "title": "开发工具集",
+      "description": "查看当前时间、统计文本字数、查看系统信息。也是插件开发的参考示例。",
+      "author": "xiaocube",
+      "version": "0.1.0",
+      "keywords": ["demo", "开发", "系统"],
+      "source": { "type": "bundled", "dir": "examples/plugins/devtools" }
+    }
+  ]
+}

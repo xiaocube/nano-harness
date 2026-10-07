@@ -34,6 +34,16 @@ export function setAskQuestion(fn: AskFn): void {
   askQuestion = fn;
 }
 
+/**
+ * 整个确认流程的注入口（v0.2 新增）：注入后 confirm() 完全交给宿主处理。
+ * 桌面端用它把权限请求变成 UI 弹窗（IPC 往返），终端不注入则走默认的
+ * "画确认框 + readline 问询"流程。返回 true = 放行。
+ */
+let confirmHandler: ((req: PermissionRequest) => Promise<boolean>) | null = null;
+export function setConfirmHandler(fn: (req: PermissionRequest) => Promise<boolean>): void {
+  confirmHandler = fn;
+}
+
 /** 一次权限确认的入参 */
 export interface PermissionRequest {
   /** 操作类别标题，如 "写入文件" / "执行命令" */
@@ -54,6 +64,11 @@ export async function confirm(req: PermissionRequest, yolo: boolean): Promise<bo
   if (yolo) {
     console.log(C.yellow(`  ⚠ [YOLO] 自动放行：${req.title} → ${req.detail.slice(0, 100)}`));
     return true;
+  }
+
+  // 宿主注入了确认处理器（桌面端）：交给它，核心不关心呈现方式
+  if (confirmHandler) {
+    return confirmHandler(req);
   }
 
   // 确认框：视觉上和普通输出区分开，让用户的注意力停在关键信息上

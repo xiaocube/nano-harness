@@ -1,7 +1,7 @@
 {
   "name": "nano-harness",
-  "version": "0.1.0",
-  "description": "零依赖、模块化的终端 AI Agent Harness —— Agent = Model + Harness 的最小完整实现",
+  "version": "0.2.0",
+  "description": "零依赖、模块化的 AI Agent Harness —— 终端 CLI + macOS 桌面应用 + 插件市场",
   "type": "module",
   "main": "dist/cli.js",
   "bin": {
@@ -12,8 +12,14 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:desktop": "tsc -p desktop/tsconfig.json",
+    "build:preload": "esbuild desktop/preload.ts --bundle --platform=node --external:electron --format=cjs --outfile=dist-desktop/preload.cjs",
+    "build:ui": "vite build --config web/vite.config.ts",
+    "build:all": "npm run build && npm run build:desktop && npm run build:preload && npm run build:ui",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
+    "desktop": "npm run build:all && electron dist-desktop/main.js",
+    "ui:dev": "vite dev --config web/vite.config.ts",
     "mock": "node scripts/mock-server.mjs",
     "prepublishOnly": "npm run build"
   },
@@ -26,18 +32,29 @@
     "openai-compatible",
     "deepseek",
     "zhipu",
-    "ollama"
+    "ollama",
+    "electron",
+    "plugin-marketplace"
   ],
   "author": "xiaocube",
   "license": "MIT",
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "marketplace"
   ],
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "electron": "^44.6.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vite": "^8.3.3"
   }
 }
