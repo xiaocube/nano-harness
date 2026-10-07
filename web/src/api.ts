@@ -169,7 +169,7 @@ function createMockAPI(): NanoharnessAPI {
       await sleep(800);
       emit({ type: 'thinking_end' });
       const answer = allowed
-        ? `（Mock 演示）我查看了项目结构，并在你允许后写入了 demo.txt。你的任务是：「${task.slice(0, 40)}」`
+        ? `（Mock 演示）我查看了项目结构，并在你允许后写入了 **demo.txt**。你的任务是：「${task.slice(0, 40)}」\n\n- 读写文件：已验证 \n- 执行命令：正常 \n\n\`nano-harness\` 的 **Markdown 渲染** working ✅`
         : `（Mock 演示）你拒绝了写文件操作，所以我只汇报：项目结构正常。你的任务是：「${task.slice(0, 40)}」`;
       current.push({ role: 'assistant', content: answer });
       emit({ type: 'answer', answer });

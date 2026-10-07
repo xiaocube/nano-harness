@@ -9,8 +9,30 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { api, type AgentEventPayload, type PermissionPayload, type AgentPreset } from '../api.js';
 import { SendIcon, ZapIcon, TerminalIcon, ShieldIcon, CheckIcon, XIcon, ChevronDownIcon, FolderIcon, SparkIcon } from './icons.js';
+
+/**
+ * 助手消息的 Markdown 渲染：模型输出的是 Markdown（加粗/列表/代码块），
+ * 直接当纯文本显示会露出 ** 星号。用户消息保持纯文本原样。
+ * 链接一律新开浏览器标签；代码块用等宽字体 + 次级底色。
+ */
+function AssistantMarkdown({ text }: { text: string }) {
+  return (
+    <div className="md">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
 
 /** 预设 pill 的展示文案（与核心 PRESET_DEFS 对齐） */
 const PRESET_LABELS: Record<AgentPreset, string> = {
@@ -166,7 +188,7 @@ export default function ChatPage({ onTurnDone }: { onTurnDone: () => void }) {
               case 'user':
                 return <div key={i} className="msg msg-user">{item.text}</div>;
               case 'assistant':
-                return <div key={i} className="msg msg-assistant">{item.text}</div>;
+                return <div key={i} className="msg msg-assistant"><AssistantMarkdown text={item.text} /></div>;
               case 'notice':
                 return <div key={i} className="msg-notice">{item.text}</div>;
               case 'meta':
