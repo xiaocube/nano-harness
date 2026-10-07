@@ -47,4 +47,7 @@ contextBridge.exposeInMainWorld('nanoharness', {
   listMarketplace: () => ipcRenderer.invoke('marketplace:list'),
   installPlugin: (name: string) => ipcRenderer.invoke('plugin:install', name),
   uninstallPlugin: (name: string) => ipcRenderer.invoke('plugin:uninstall', name),
+  togglePlugin: (name: string, enabled: boolean) => ipcRenderer.invoke('plugin:toggle', name, enabled),
+  revealPluginsDir: () => ipcRenderer.invoke('plugin:reveal'),
+  getAppInfo: () => ipcRenderer.invoke('app:info'),
 });

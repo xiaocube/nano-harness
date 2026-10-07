@@ -1,112 +1,195 @@
 /**
- * PluginsPage.tsx —— 插件市场
+ * PluginsPage.tsx —— 插件市场（dsh 风格）
  *
- * 两个信息区：
- *   1. 市场索引（marketplace/index.json）：卡片网格，一键安装/卸载
- *   2. 发布指引：上传 = 向主仓库的索引提 PR（开源社区标准流程）
+ * 参照 dsh 的插件页布局：标题 + "添加插件"主按钮，官方插件以列表行呈现，
+ * 每行 = 彩色图标 + 名称徽章 + 描述 + 工具清单 + 启用开关（实时生效）。
+ * 已安装但不在官方索引里的本地插件单列一节。
+ * "添加插件"弹窗提供两条路径：Finder 打开插件目录手动放置 / 提 PR 上架官方索引。
  */
 
 import { useEffect, useState } from 'react';
 import { api, type InstalledPlugin, type MarketplaceEntry } from '../api.js';
-import { PuzzleIcon, DownloadIcon, CheckIcon, TrashIcon } from './icons.js';
+import { PuzzleIcon, DownloadIcon, CheckIcon, TrashIcon, RefreshIcon, PlusIcon, FolderIcon, XIcon } from './icons.js';
+
+/** 按插件名稳定选一个颜色，让每行图标像 dsh 一样各有身份 */
+const TINTS = ['#0A84FF', '#16A34A', '#EA580C', '#8B5CF6', '#0EA5E9', '#DB2777', '#CA8A04'];
+function tintOf(name: string): string {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return TINTS[h % TINTS.length];
+}
+
+/** 一个统一的行数据：市场条目 ∪ 本地已安装 */
+interface Row {
+  key: string;
+  name: string;
+  title: string;
+  description: string;
+  author: string;
+  version: string;
+  keywords?: string[];
+  installed: boolean;
+  enabled: boolean;
+  toolNames: string[];
+  loadError: string | null;
+  official: boolean;
+}
 
 export default function PluginsPage() {
-  const [entries, setEntries] = useState<MarketplaceEntry[]>([]);
-  const [installed, setInstalled] = useState<InstalledPlugin[]>([]);
-  const [installing, setInstalling] = useState<string | null>(null);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
 
-  const refresh = () => {
-    void api.listMarketplace().then((idx) => setEntries(idx.plugins));
-    void api.listInstalledPlugins().then(setInstalled);
+  const refresh = async () => {
+    const [index, installed] = await Promise.all([api.listMarketplace(), api.listInstalledPlugins()]);
+    const byName = new Map(installed.map((p) => [p.manifest.name, p]));
+    const official: Row[] = index.plugins.map((e: MarketplaceEntry) => {
+      const inst = byName.get(e.name);
+      return {
+        key: e.name, name: e.name, title: e.title, description: e.description,
+        author: e.author, version: inst?.manifest.version ?? e.version, keywords: e.keywords,
+        installed: Boolean(inst), enabled: inst?.enabled ?? false,
+        toolNames: inst?.toolNames ?? [], loadError: inst?.loadError ?? null, official: true,
+      };
+    });
+    // 已安装但不在官方索引里的（手动放进插件目录的），单独列出
+    const local: Row[] = installed
+      .filter((p) => !index.plugins.some((e) => e.name === p.manifest.name))
+      .map((p: InstalledPlugin) => ({
+        key: p.manifest.name, name: p.manifest.name, title: p.manifest.name,
+        description: p.manifest.description, author: p.manifest.author, version: p.manifest.version,
+        installed: true, enabled: p.enabled, toolNames: p.toolNames,
+        loadError: p.loadError, official: false,
+      }));
+    setRows([...official, ...local]);
   };
-  useEffect(refresh, []);
-
-  const isInstalled = (name: string) => installed.some((p) => p.manifest.name === name && !p.loadError);
+  useEffect(() => { void refresh(); }, []);
 
   const install = async (name: string) => {
-    setInstalling(name);
-    setNotice(null);
+    setBusy(name); setNotice(null);
     const res = await api.installPlugin(name);
-    setInstalling(null);
+    setBusy(null); setNotice(res.message);
+    await refresh();
+  };
+
+  const toggle = async (name: string, enabled: boolean) => {
+    // 乐观更新：开关先动，结果提示随后
+    setRows((xs) => xs.map((r) => (r.name === name ? { ...r, enabled } : r)));
+    const res = await api.togglePlugin(name, enabled);
     setNotice(res.message);
-    refresh();
+    if (!res.ok) await refresh();
   };
 
   const uninstall = async (name: string) => {
     const res = await api.uninstallPlugin(name);
     setNotice(res.message);
-    refresh();
+    await refresh();
   };
+
+  const officialRows = rows.filter((r) => r.official);
+  const localRows = rows.filter((r) => !r.official);
 
   return (
     <div className="page">
-      <h1 className="page-title">插件市场</h1>
-      <p className="page-sub">
-        插件 = 工具包。安装后立刻成为 agent 可用的新能力，与内置工具完全同构。
-      </p>
-
-      {notice && <div className="msg-notice" style={{ marginBottom: 14, display: 'inline-block' }}>{notice}</div>}
-
-      <div className="plugin-grid">
-        {entries.map((entry) => {
-          const done = isInstalled(entry.name);
-          return (
-            <div key={entry.name} className="plugin-card">
-              <div className="plugin-card-head">
-                <span className="p-icon"><PuzzleIcon size={16} /></span>
-                <h3>{entry.title}</h3>
-                <span className="ver">v{entry.version}</span>
-              </div>
-              <p className="desc">{entry.description}</p>
-              <div className="meta">
-                <span>@{entry.author}</span>
-                {entry.keywords?.map((k) => <span key={k} className="kw">{k}</span>)}
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                {done ? (
-                  <>
-                    <span className="badge-installed" style={{ marginRight: 'auto' }}>
-                      <CheckIcon size={13} /> 已安装
-                    </span>
-                    <button className="btn btn-ghost" onClick={() => void uninstall(entry.name)}>
-                      <TrashIcon size={13} /> 卸载
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    className="btn btn-accent"
-                    disabled={installing === entry.name}
-                    onClick={() => void install(entry.name)}
-                  >
-                    <DownloadIcon size={13} /> {installing === entry.name ? '安装中…' : '安装'}
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-        {entries.length === 0 && (
-          <div style={{ color: 'var(--fg-secondary)', fontSize: 13 }}>
-            市场索引为空——检查 marketplace/index.json 是否存在。
-          </div>
-        )}
+      <div className="page-head">
+        <div>
+          <h1 className="page-title">插件</h1>
+          <p className="page-sub">安装、启用和配置插件——插件是 agent 的新能力，开关实时生效。</p>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="icon-btn" title="刷新" onClick={() => void refresh()}><RefreshIcon size={14} /></button>
+          <button className="btn btn-accent" onClick={() => setShowAdd(true)}><PlusIcon size={14} /> 添加插件</button>
+        </div>
       </div>
 
-      <div className="publish-card">
-        <strong style={{ color: 'var(--fg)' }}>想发布你自己的插件？</strong>
-        <ol>
-          <li>
-            写一个文件夹：<code>plugin.json</code>（说明书）+ <code>tools.mjs</code>
-            （默认导出 <code>{'{ tools: [...] }'}</code>，工具结构与内置工具完全一致，参考仓库里的{' '}
-            <code>examples/plugins/devtools</code>）；
-          </li>
-          <li>发布到任意公开 GitHub 仓库；</li>
-          <li>
-            向主仓库的 <code>marketplace/index.json</code> 提 PR，加一条你的插件信息；
-          </li>
-          <li>合并后全世界的 nano-harness 用户都能一键安装你的插件。</li>
-        </ol>
+      {notice && <div className="msg-notice" style={{ marginBottom: 12, display: 'inline-block' }}>{notice}</div>}
+
+      <div className="section-head">官方 <span className="section-count">{officialRows.length}</span></div>
+      {officialRows.map((r) => <PluginRow key={r.key} row={r} busy={busy} onInstall={install} onToggle={toggle} onUninstall={uninstall} />)}
+      {officialRows.length === 0 && <div className="p-desc">市场索引为空——检查 marketplace/index.json。</div>}
+
+      {localRows.length > 0 && (
+        <>
+          <div className="section-head">本地 <span className="section-count">{localRows.length}</span></div>
+          {localRows.map((r) => <PluginRow key={r.key} row={r} busy={busy} onInstall={install} onToggle={toggle} onUninstall={uninstall} />)}
+        </>
+      )}
+
+      {showAdd && (
+        <div className="overlay" role="dialog" aria-modal="true" aria-label="添加插件">
+          <div className="sheet">
+            <h3><PlusIcon size={16} /> 添加插件</h3>
+            <p className="p-desc" style={{ marginBottom: 12 }}>
+              两种方式把插件装进来：
+            </p>
+            <div className="detail" style={{ marginBottom: 14 }}>
+              ① 手动安装：把插件文件夹（含 plugin.json + tools.mjs）放入插件目录，点"打开插件目录"直达；{'\n'}
+              ② 上架市场：发布到 GitHub 后向主仓库 marketplace/index.json 提 PR，全用户可见。
+            </div>
+            <div className="actions">
+              <button className="btn" onClick={() => setShowAdd(false)}><XIcon size={13} /> 关闭</button>
+              <button className="btn btn-accent" onClick={() => { void api.revealPluginsDir(); }}>
+                <FolderIcon size={13} /> 打开插件目录
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PluginRow({
+  row, busy, onInstall, onToggle, onUninstall,
+}: {
+  row: Row;
+  busy: string | null;
+  onInstall: (name: string) => void;
+  onToggle: (name: string, enabled: boolean) => void;
+  onUninstall: (name: string) => void;
+}) {
+  return (
+    <div className={`plugin-row${row.installed && !row.enabled ? ' disabled-row' : ''}`}>
+      <span className="p-icon" style={{ background: tintOf(row.name) }}>
+        <PuzzleIcon size={18} />
+      </span>
+      <div className="p-info">
+        <div className="p-name">
+          {row.title}
+          {row.official && <span className="p-badge">官方</span>}
+          {row.installed && <span className="p-badge p-badge-gray">v{row.version}</span>}
+        </div>
+        <p className="p-desc">{row.description}</p>
+        {row.loadError
+          ? <p className="p-tools" style={{ color: 'var(--danger)' }}>加载失败：{row.loadError}</p>
+          : row.installed && row.toolNames.length > 0 && (
+            <p className="p-tools">工具：{row.toolNames.join(' · ')}</p>
+          )}
+      </div>
+      <div className="p-actions">
+        {row.installed ? (
+          <>
+            <button className="text-btn" title="卸载" onClick={() => onUninstall(row.name)}>
+              <TrashIcon size={14} />
+            </button>
+            <button
+              className={`switch${row.enabled ? ' on' : ''}`}
+              role="switch"
+              aria-checked={row.enabled}
+              aria-label={`启用 ${row.name}`}
+              onClick={() => onToggle(row.name, !row.enabled)}
+            />
+          </>
+        ) : (
+          <button
+            className="btn btn-accent"
+            disabled={busy === row.name}
+            onClick={() => onInstall(row.name)}
+          >
+            {busy === row.name ? '安装中…' : <><DownloadIcon size={13} /> 安装</>}
+          </button>
+        )}
       </div>
     </div>
   );

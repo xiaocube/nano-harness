@@ -259,6 +259,69 @@ code, .mono { font-family: var(--font-mono); font-size: 12.5px; }
 .status-ok { color: var(--success); }
 .status-err { color: var(--danger); }
 
+/* ============ 插件市场（dsh 风格：列表行 + 启用开关） ============ */
+.page-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 6px; }
+.icon-btn {
+  width: 30px; height: 30px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--card);
+  display: grid; place-items: center; color: var(--fg-secondary);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.icon-btn:hover { background: var(--accent-tint); color: var(--accent); }
+.section-head { display: flex; align-items: center; gap: 8px; margin: 20px 0 10px; font-size: 13px; font-weight: 600; }
+.section-count {
+  font-size: 11px; color: var(--fg-secondary); font-family: var(--font-mono);
+  background: var(--muted); padding: 0 8px; border-radius: 10px; font-weight: 400;
+}
+.plugin-row {
+  display: flex; align-items: center; gap: 13px;
+  padding: 12px 14px; margin-bottom: 10px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius-card); box-shadow: var(--shadow-card);
+  transition: border-color var(--t-fast);
+  max-width: 720px;
+}
+.plugin-row:hover { border-color: var(--glass-border); }
+.plugin-row .p-icon {
+  width: 40px; height: 40px; border-radius: 10px; flex: none;
+  display: grid; place-items: center; color: #fff;
+}
+.plugin-row.disabled-row .p-icon,
+.plugin-row.disabled-row .p-name { opacity: 0.55; }
+.plugin-row .p-info { flex: 1; min-width: 0; }
+.plugin-row .p-name { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; }
+.p-badge { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: var(--accent-tint); color: var(--accent); font-weight: 500; }
+.p-badge-gray { background: var(--muted); color: var(--fg-secondary); }
+.plugin-row .p-desc { margin: 2px 0 0; font-size: 12.5px; color: var(--fg-secondary); }
+.plugin-row .p-tools { margin: 3px 0 0; font-size: 11px; color: var(--fg-secondary); font-family: var(--font-mono); }
+.plugin-row .p-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.text-btn { border: none; background: none; color: var(--fg-secondary); font-size: 12px; padding: 4px 6px; border-radius: 6px; transition: color var(--t-fast); }
+.text-btn:hover { color: var(--danger); }
+
+/* macOS 风格开关（开启 = 系统绿） */
+.switch {
+  position: relative; width: 40px; height: 24px; flex: none;
+  border-radius: 12px; border: none; padding: 0;
+  background: var(--border); transition: background var(--t-med);
+}
+.switch::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform var(--t-med);
+}
+.switch.on { background: var(--success); }
+.switch.on::after { transform: translateX(16px); }
+
+/* 侧栏：工作区分组 */
+.workspace-item {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 9px; font-size: 12.5px; font-weight: 600;
+  color: var(--fg); border-radius: var(--radius-btn);
+}
+.workspace-item svg { color: var(--accent); }
+.session-item.indented { margin-left: 14px; font-size: 12px; }
+
 /* ============ 权限弹窗（macOS sheet 质感） ============ */
 .overlay {
   position: fixed; inset: 0; background: var(--overlay);

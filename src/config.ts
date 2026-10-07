@@ -31,6 +31,8 @@ export interface HarnessConfig {
   contextChars: number;
   /** 桌面版外观：跟随系统/浅色/深色（CLI 忽略此项） */
   appearance?: 'system' | 'light' | 'dark';
+  /** 插件启用状态表：缺省视为启用，{ "名字": false } 表示禁用 */
+  plugins?: Record<string, boolean>;
 }
 
 /** 配置目录：~/.nano-harness/（配置文件、会话记录都放这里） */
@@ -114,6 +116,9 @@ export async function loadConfig(): Promise<HarnessConfig> {
     if (typeof raw.contextChars === 'number' && raw.contextChars > 0) cfg.contextChars = raw.contextChars;
     if (raw.appearance === 'system' || raw.appearance === 'light' || raw.appearance === 'dark') {
       cfg.appearance = raw.appearance;
+    }
+    if (raw.plugins && typeof raw.plugins === 'object' && !Array.isArray(raw.plugins)) {
+      cfg.plugins = raw.plugins;
     }
   } catch {
     // 首次运行或文件损坏：用默认值，不报错

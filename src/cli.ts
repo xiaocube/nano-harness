@@ -168,13 +168,14 @@ async function handleCommand(
       return 'handled';
 
     case '/plugins': {
-      const plugins = await loadInstalledPlugins(false);
+      const plugins = await loadInstalledPlugins(cfg, false);
       if (plugins.length === 0) {
         console.log(C.gray('  未安装任何插件。插件目录：~/.nano-harness/plugins/'));
       } else {
         for (const p of plugins) {
-          const info = p.loadError ? C.red(`加载失败: ${p.loadError}`) : C.gray(`工具: ${p.toolNames.join(', ') || '无'}`);
-          console.log(`  ${C.cyan(p.manifest.name)} v${p.manifest.version}  ${info}`);
+          const state = p.loadError ? C.red(`加载失败: ${p.loadError}`) : C.gray(`工具: ${p.toolNames.join(', ') || '无'}`);
+          const flag = p.enabled ? C.green('✓') : C.yellow('✗禁用');
+          console.log(`  ${flag} ${C.cyan(p.manifest.name)} v${p.manifest.version}  ${state}`);
         }
       }
       return 'handled';
@@ -285,8 +286,8 @@ async function main(): Promise<void> {
 
   // 登记全部内置工具（想加自定义工具？看 src/tools/index.ts 的说明）
   await registerBuiltinTools();
-  // 加载用户已安装的插件工具（~/.nano-harness/plugins/，失败不阻塞启动）
-  for (const p of await loadInstalledPlugins(true)) {
+  // 加载用户已安装的插件工具（~/.nano-harness/plugins/，禁用的插件跳过，失败不阻塞启动）
+  for (const p of await loadInstalledPlugins(cfg, true)) {
     if (p.loadError) console.error(C.yellow(`  ⚠ 插件 ${p.manifest.name} 加载失败：${p.loadError}`));
   }
 

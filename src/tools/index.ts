@@ -38,13 +38,29 @@ export interface Tool {
 
 /** 注册表本体：工具名 → 工具对象 */
 const registry = new Map<string, Tool>();
+/** 工具归属：工具名 → 提供者（'builtin' 或插件名）。插件禁用时据此成批注销 */
+const owners = new Map<string, string>();
 
-/** 登记一个工具 */
-export function registerTool(tool: Tool): void {
+/** 登记一个工具（owner 标记提供者：内置为 builtin，插件为其名） */
+export function registerTool(tool: Tool, owner = 'builtin'): void {
   if (registry.has(tool.name)) {
     throw new Error(`工具重名：${tool.name}`);
   }
   registry.set(tool.name, tool);
+  owners.set(tool.name, owner);
+}
+
+/** 按提供者批量注销工具（插件禁用/卸载时调用），返回注销数量 */
+export function unregisterByOwner(owner: string): number {
+  let removed = 0;
+  for (const [name, o] of [...owners.entries()]) {
+    if (o === owner) {
+      registry.delete(name);
+      owners.delete(name);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 /** 按名取工具（模型调用了不存在的工具时返回 undefined，由 loop 层兜底报错） */

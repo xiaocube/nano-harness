@@ -30,6 +30,7 @@ export interface InstalledPlugin {
   dir: string;
   toolNames: string[];
   loadError: string | null;
+  enabled: boolean;
 }
 
 export interface MarketplaceEntry {
@@ -73,6 +74,10 @@ export interface NanoharnessAPI {
   listMarketplace(): Promise<MarketplaceIndex>;
   installPlugin(name: string): Promise<{ ok: boolean; message: string }>;
   uninstallPlugin(name: string): Promise<{ ok: boolean; message: string }>;
+  togglePlugin(name: string, enabled: boolean): Promise<{ ok: boolean; message: string }>;
+  revealPluginsDir(): Promise<{ ok: boolean }>;
+  /** 应用信息：工作区路径等（侧栏展示用） */
+  getAppInfo(): Promise<{ workspace: string; version: string }>;
 }
 
 declare global {
@@ -98,6 +103,7 @@ function createMockAPI(): NanoharnessAPI {
       maxSteps: 25, yolo: false, contextChars: 48000, appearance: 'system' as const,
     } as HarnessConfig,
     installed: [] as InstalledPlugin[],
+    disabledPlugins: {} as Record<string, boolean>,
   };
 
   return {
@@ -168,7 +174,9 @@ function createMockAPI(): NanoharnessAPI {
         { name: 'run_bash', description: '执行一条 bash 命令并返回输出', needsPermission: true },
       ];
     },
-    async listInstalledPlugins() { return store.installed; },
+    async listInstalledPlugins() {
+      return store.installed.map((p) => ({ ...p, enabled: store.disabledPlugins[p.manifest.name] !== true }));
+    },
     async listMarketplace() {
       return {
         version: 1,
@@ -184,7 +192,7 @@ function createMockAPI(): NanoharnessAPI {
       await sleep(800);
       store.installed.push({
         manifest: { name, version: '0.1.0', description: '演示插件', author: 'xiaocube' },
-        dir: `~/.nano-harness/plugins/${name}`, toolNames: ['get_time'], loadError: null,
+        dir: `~/.nano-harness/plugins/${name}`, toolNames: ['get_time'], loadError: null, enabled: true,
       });
       return { ok: true, message: `已安装 ${name}（Mock）` };
     },
@@ -192,6 +200,12 @@ function createMockAPI(): NanoharnessAPI {
       store.installed = store.installed.filter((p) => p.manifest.name !== name);
       return { ok: true, message: `已卸载 ${name}（Mock）` };
     },
+    async togglePlugin(name: string, enabled: boolean) {
+      store.disabledPlugins[name] = !enabled;
+      return { ok: true, message: `${enabled ? '已启用' : '已禁用'} ${name}（Mock）` };
+    },
+    async revealPluginsDir() { return { ok: true }; },
+    async getAppInfo() { return { workspace: '/Users/demo/project', version: '0.2.0' }; },
   };
 }
 

@@ -72,7 +72,7 @@ export function startSpinner(text: string): { stop: (finalText?: string) => void
 /** 启动横幅：告诉用户"我是谁、当前用什么模型、怎么获得帮助" */
 export function banner(model: string, workspace: string, yolo: boolean): void {
   console.log('');
-  console.log(C.cyan('  ⚡ nano-harness v0.1.0 ') + C.gray('—— 你的第一个 AI Agent Harness'));
+  console.log(C.cyan('  ⚡ nano-harness v0.2.0 ') + C.gray('—— 你的第一个 AI Agent Harness'));
   console.log(C.gray('  Agent = Model + Harness，模型是马，harness 是缰绳。'));
   console.log('');
   console.log(`  ${C.gray('模型     ')}${C.bold(model)}`);

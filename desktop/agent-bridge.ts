@@ -11,14 +11,17 @@
  *   loop 拿到放行/拒绝继续执行。Promise 挂起期间 loop 自然"暂停"。
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain, shell } from 'electron';
 import { runAgentTurn, type AgentEvent } from '../dist/loop.js';
 import type { ChatMessage } from '../dist/llm.js';
 import { loadConfig, saveConfig, type HarnessConfig } from '../dist/config.js';
 import { saveSession, listSessions, loadSession } from '../dist/session.js';
 import { registerBuiltinTools, listTools } from '../dist/tools/index.js';
 import { setConfirmHandler, type PermissionRequest } from '../dist/permission.js';
-import { loadInstalledPlugins, fetchMarketplace, installFromEntry, uninstallPlugin } from '../dist/plugins.js';
+import {
+  loadInstalledPlugins, fetchMarketplace, installFromEntry, uninstallPlugin,
+  setPluginEnabled, listInstalled, PLUGINS_DIR,
+} from '../dist/plugins.js';
 import { callChat } from '../dist/llm.js';
 
 /** 广播函数类型：主进程 → 渲染层的事件通道 */
@@ -36,7 +39,8 @@ export function createAgentBridge(broadcast: Broadcast): void {
   /* ---------- 启动准备：内置工具 + 插件 ---------- */
   void (async () => {
     await registerBuiltinTools();
-    for (const p of await loadInstalledPlugins(true)) {
+    const cfg = await loadConfig();
+    for (const p of await loadInstalledPlugins(cfg, true)) {
       if (p.loadError) broadcast({ type: 'tool_result', name: 'plugin', preview: `插件 ${p.manifest.name} 加载失败：${p.loadError}` });
     }
   })();
@@ -119,18 +123,34 @@ export function createAgentBridge(broadcast: Broadcast): void {
     name: t.name, description: t.description, needsPermission: t.needsPermission,
   })));
 
-  ipcMain.handle('plugin:installed', () => loadInstalledPlugins(false));
+  ipcMain.handle('plugin:installed', async () => listInstalled(await loadConfig()));
   ipcMain.handle('marketplace:list', () => fetchMarketplace());
   ipcMain.handle('plugin:install', async (_e, name: string) => {
     const index = await fetchMarketplace();
     const entry = index.plugins.find((p) => p.name === name);
     if (!entry) return { ok: false, message: `市场里没有叫 ${name} 的插件` };
     const result = await installFromEntry(entry);
-    if (result.ok) await loadInstalledPlugins(true); // 装完立刻注册进工具表
+    if (result.ok) await loadInstalledPlugins(await loadConfig(), true); // 装完立刻注册进工具表
+    return result;
+  });
+  // 启用/禁用开关：实时生效（注册/注销工具）+ 状态写入配置持久化
+  ipcMain.handle('plugin:toggle', async (_e, name: string, enabled: boolean) => {
+    const cfg = await loadConfig();
+    const result = await setPluginEnabled(name, enabled, cfg);
+    if (result.ok) {
+      await saveConfig({ ...cfg, plugins: { ...(cfg.plugins ?? {}), [name]: enabled } });
+    }
     return result;
   });
   ipcMain.handle('plugin:uninstall', async (_e, name: string) => {
     await uninstallPlugin(name);
-    return { ok: true, message: `已卸载 ${name}（重启应用后生效）` };
+    return { ok: true, message: `已卸载 ${name}` };
   });
+  // 在 Finder 里打开插件目录（"添加插件"手动安装入口）
+  ipcMain.handle('plugin:reveal', () => {
+    void shell.openPath(PLUGINS_DIR);
+    return { ok: true };
+  });
+  // 应用信息（侧栏展示工作区名）
+  ipcMain.handle('app:info', () => ({ workspace: process.cwd(), version: '0.2.0' }));
 }

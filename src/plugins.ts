@@ -13,6 +13,9 @@
  *   - 上传 = 向索引提 PR（开源社区标准玩法，免自建服务器）。
  *   - 支持两种来源：bundled（随安装包内置，离线可用）/ github（仓库 tarball）。
  *
+ * 启用/禁用：状态存于配置文件（cfg.plugins["名字"] = false 表示禁用），
+ * 通过 setPluginEnabled 可以**不重启**实时生效——注册表按提供者归属，禁用即注销。
+ *
  * ⚠ 安全须知（v1 如实声明）：插件代码在 harness 进程内运行，拥有与 harness
  * 相同的权限（可访问文件系统与网络）。安装第三方插件前请先看它的源码。
  * 沙箱化插件运行时（worker/子进程 + 权限声明）在路线图中。
@@ -22,13 +25,27 @@ import { promises as fs } from 'node:fs';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { exec as execCb } from 'node:child_process';
-import { registerTool, listTools, type Tool } from './tools/index.js';
-import { CONFIG_DIR } from './config.js';
+import { registerTool, unregisterByOwner, listTools, type Tool } from './tools/index.js';
+import { CONFIG_DIR, type HarnessConfig } from './config.js';
 
 /** 插件安装目录 */
 export const PLUGINS_DIR = path.join(CONFIG_DIR, 'plugins');
+
+/**
+ * 项目资源定位：marketplace/ 与 examples/ 随仓库分发。
+ * 开发时用 cwd（= 仓库根）；打包成 .app 后 cwd 不再是仓库，
+ * 所以按"本模块位置"向上推导（dist/plugins.js → 仓库根；asar 包内同理）。
+ */
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = path.resolve(MODULE_DIR, '..', '..');
+
+function resourcePath(...segments: string[]): string {
+  const bundled = path.join(PROJECT_ROOT, ...segments);
+  if (fsSync.existsSync(bundled)) return bundled;
+  return path.join(process.cwd(), ...segments); // 兜底：某些宿主从仓库根启动
+}
 
 /** 插件说明书（plugin.json） */
 export interface PluginManifest {
@@ -45,10 +62,12 @@ export interface InstalledPlugin {
   manifest: PluginManifest;
   /** 插件安装目录绝对路径 */
   dir: string;
-  /** 该插件注册的工具名 */
+  /** 该插件提供的工具名 */
   toolNames: string[];
   /** 加载失败时的原因（正常安装为 null） */
   loadError: string | null;
+  /** 当前是否启用（配置驱动） */
+  enabled: boolean;
 }
 
 /** 市场索引条目（marketplace/index.json 里的一个插件） */
@@ -70,14 +89,31 @@ export interface MarketplaceIndex {
   plugins: MarketplaceEntry[];
 }
 
-/** 随包分发的内置市场索引（仓库根 marketplace/index.json） */
-const BUNDLED_INDEX_PATH = path.resolve(process.cwd(), 'marketplace/index.json');
+/** 插件目录是否启用（缺省 = 启用） */
+export function isEnabled(cfg: HarnessConfig | undefined, name: string): boolean {
+  return cfg?.plugins?.[name] !== false;
+}
 
-/**
- * 加载单个插件目录：读 plugin.json → 动态 import 工具模块 → 校验 Tool[] 形状。
- * 注意用 .mjs：插件目录没有 package.json，.js 会被 Node 当 CommonJS 处理。
- */
-async function loadPluginDir(dir: string, register: boolean): Promise<InstalledPlugin> {
+/** 动态 import 插件模块并校验 Tool[] 形状；不负责注册 */
+async function importPluginTools(dir: string, manifest: PluginManifest): Promise<Tool[]> {
+  const mainFile = path.join(dir, manifest.main ?? 'tools.mjs');
+  const mod = await import(pathToFileURL(mainFile).href) as {
+    tools?: unknown;
+    default?: { tools?: unknown };
+  };
+  // 约定：命名导出 tools 或默认导出 { tools } 均可
+  const tools = mod.tools ?? mod.default?.tools;
+  if (!Array.isArray(tools)) {
+    throw new Error('插件模块必须导出 tools 数组（命名导出或默认导出均可）');
+  }
+  // 形状校验：像 Tool 的才收——防御插件写错导致 harness 崩溃
+  return (tools as Tool[]).filter(
+    (t) => typeof t?.name === 'string' && typeof t?.execute === 'function',
+  );
+}
+
+/** 读取插件目录（不注册），返回清单 + 工具名 + 启用状态 */
+async function inspectPluginDir(dir: string, cfg: HarnessConfig | undefined): Promise<InstalledPlugin> {
   let manifest: PluginManifest;
   try {
     manifest = JSON.parse(await fs.readFile(path.join(dir, 'plugin.json'), 'utf8')) as PluginManifest;
@@ -86,40 +122,20 @@ async function loadPluginDir(dir: string, register: boolean): Promise<InstalledP
       manifest: { name: path.basename(dir), version: '?', description: '', author: '?' },
       dir, toolNames: [],
       loadError: `plugin.json 读取失败：${(err as Error).message}`,
+      enabled: false,
     };
   }
-
-  const before = new Set(listTools().map((t) => t.name));
+  const enabled = isEnabled(cfg, manifest.name);
   try {
-    const mainFile = path.join(dir, manifest.main ?? 'tools.mjs');
-    const mod = await import(pathToFileURL(mainFile).href) as {
-      tools?: unknown;
-      default?: { tools?: unknown };
-    };
-    // 约定：命名导出 tools 或默认导出 { tools } 均可
-    const tools = mod.tools ?? mod.default?.tools;
-    if (!Array.isArray(tools)) {
-      throw new Error('插件模块必须导出 tools 数组（命名导出或默认导出均可）');
-    }
-    // 形状校验：像 Tool 的才收——防御插件写错导致 harness 崩溃。
-    // register=false 时只统计不注册（供 UI 展示已装列表用）
-    const toolNames: string[] = [];
-    for (const tool of tools as Tool[]) {
-      if (typeof tool?.name === 'string' && typeof tool?.execute === 'function') {
-        toolNames.push(tool.name);
-        if (register && !before.has(tool.name)) {
-          registerTool(tool);
-        }
-      }
-    }
-    return { manifest, dir, toolNames, loadError: null };
+    const tools = await importPluginTools(dir, manifest);
+    return { manifest, dir, toolNames: tools.map((t) => t.name), loadError: null, enabled };
   } catch (err) {
-    return { manifest, dir, toolNames: [], loadError: `工具加载失败：${(err as Error).message}` };
+    return { manifest, dir, toolNames: [], loadError: `工具加载失败：${(err as Error).message}`, enabled };
   }
 }
 
-/** 扫描并加载插件目录下的所有插件（宿主启动时调用一次） */
-export async function loadInstalledPlugins(register = true): Promise<InstalledPlugin[]> {
+/** 扫描插件目录，注册所有"已启用"插件的工具（宿主启动时调用一次） */
+export async function loadInstalledPlugins(cfg: HarnessConfig | undefined, register = true): Promise<InstalledPlugin[]> {
   let names: string[] = [];
   try {
     names = await fs.readdir(PLUGINS_DIR);
@@ -129,22 +145,64 @@ export async function loadInstalledPlugins(register = true): Promise<InstalledPl
   const results: InstalledPlugin[] = [];
   for (const name of names.filter((n) => !n.startsWith('.'))) {
     const dir = path.join(PLUGINS_DIR, name);
-    if ((await fs.stat(dir)).isDirectory()) {
-      results.push(await loadPluginDir(dir, register));
+    if (!(await fs.stat(dir)).isDirectory()) continue;
+    const info = await inspectPluginDir(dir, cfg);
+    // 启用且加载成功才注册；注册时打上归属标记（插件名），禁用时可成批注销
+    if (register && info.enabled && !info.loadError) {
+      const tools = await importPluginTools(dir, info.manifest);
+      for (const tool of tools) {
+        if (!listTools().some((t) => t.name === tool.name)) {
+          registerTool(tool, info.manifest.name);
+        }
+      }
     }
+    results.push(info);
   }
   return results;
 }
 
-/** 已安装插件列表（不重复注册工具，仅供 UI 展示） */
-export async function listInstalled(): Promise<InstalledPlugin[]> {
-  return loadInstalledPlugins(false);
+/** 已安装插件列表（不注册工具，仅供 UI 展示） */
+export async function listInstalled(cfg: HarnessConfig | undefined): Promise<InstalledPlugin[]> {
+  return loadInstalledPlugins(cfg, false);
 }
 
-/** 卸载插件：直接删除其目录 */
-export async function uninstallPlugin(name: string): Promise<void> {
+/**
+ * 切换插件启用状态（实时生效，无需重启）：
+ * 启用 = 加载其模块并把工具注册进注册表；禁用 = 按归属批量注销工具。
+ */
+export async function setPluginEnabled(
+  name: string,
+  enabled: boolean,
+  cfg: HarnessConfig,
+): Promise<{ ok: boolean; message: string }> {
   const dir = path.join(PLUGINS_DIR, name);
-  await fs.rm(dir, { recursive: true, force: true });
+  if (!fsSync.existsSync(path.join(dir, 'plugin.json'))) {
+    return { ok: false, message: `未找到插件 ${name}` };
+  }
+  if (enabled) {
+    try {
+      const manifest = JSON.parse(await fs.readFile(path.join(dir, 'plugin.json'), 'utf8')) as PluginManifest;
+      const tools = await importPluginTools(dir, manifest);
+      let registered = 0;
+      for (const tool of tools) {
+        if (!listTools().some((t) => t.name === tool.name)) {
+          registerTool(tool, name);
+          registered++;
+        }
+      }
+      return { ok: true, message: `已启用 ${name}（注册 ${registered} 个工具）` };
+    } catch (err) {
+      return { ok: false, message: `启用失败：${(err as Error).message}` };
+    }
+  }
+  const removed = unregisterByOwner(name);
+  return { ok: true, message: `已禁用 ${name}（移除 ${removed} 个工具）` };
+}
+
+/** 卸载插件：先注销其工具，再删除目录 */
+export async function uninstallPlugin(name: string): Promise<void> {
+  unregisterByOwner(name);
+  await fs.rm(path.join(PLUGINS_DIR, name), { recursive: true, force: true });
 }
 
 /**
@@ -156,7 +214,7 @@ export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: b
   try {
     if (entry.source.type === 'bundled') {
       // 内置示例：直接复制（Node 没有内置 cp -r，手动递归）
-      const src = path.resolve(process.cwd(), entry.source.dir);
+      const src = resourcePath(entry.source.dir);
       await copyDir(src, dest);
       return { ok: true, message: `已安装内置插件 ${entry.name}` };
     }
@@ -196,7 +254,7 @@ export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: b
 /** 读取市场索引：优先包内 bundled 索引（离线可用），失败给空索引 */
 export async function fetchMarketplace(): Promise<MarketplaceIndex> {
   try {
-    const raw = await fs.readFile(BUNDLED_INDEX_PATH, 'utf8');
+    const raw = await fs.readFile(resourcePath('marketplace', 'index.json'), 'utf8');
     return JSON.parse(raw) as MarketplaceIndex;
   } catch {
     return { version: 1, plugins: [] };

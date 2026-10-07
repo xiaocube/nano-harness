@@ -16,6 +16,7 @@
     "build:preload": "esbuild desktop/preload.ts --bundle --platform=node --external:electron --format=cjs --outfile=dist-desktop/preload.cjs",
     "build:ui": "vite build --config web/vite.config.ts",
     "build:all": "npm run build && npm run build:desktop && npm run build:preload && npm run build:ui",
+    "pack": "npm run build:all && electron-builder --mac",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "desktop": "npm run build:all && electron dist-desktop/main.js",
@@ -38,6 +39,29 @@
   ],
   "author": "xiaocube",
   "license": "MIT",
+  "build": {
+    "appId": "cc.xiaocube.nano-harness",
+    "productName": "nano-harness",
+    "directories": {
+      "output": "release"
+    },
+    "extraMetadata": {
+      "main": "dist-desktop/main.js"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-desktop/**/*",
+      "web/dist/**/*",
+      "marketplace/**/*",
+      "examples/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": { "target": "dir", "arch": ["arm64"] },
+      "identity": null,
+      "category": "public.app-category.developer-tools"
+    }
+  },
   "files": [
     "dist",
     "README.md",
@@ -50,6 +74,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
     "electron": "^44.6.0",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",

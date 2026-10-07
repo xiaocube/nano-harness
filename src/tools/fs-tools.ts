@@ -162,8 +162,10 @@ export function registerFsTools(): void {
     },
   };
 
-  // 把四个工具登记进注册表
-  [readFile, writeFile, editFile, listDir].forEach(registerTool);
+  // 把四个工具登记进注册表（注意不能用 forEach(registerTool)，会把索引误当 owner）
+  for (const tool of [readFile, writeFile, editFile, listDir]) {
+    registerTool(tool);
+  }
 }
 
 /** 供 loop 层在权限确认框里展示写操作内容预览 */
