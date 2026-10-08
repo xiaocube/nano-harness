@@ -3,13 +3,12 @@
 ![platform](https://img.shields.io/badge/platform-macOS-000000)
 ![node](https://img.shields.io/badge/node-%E2%89%A520-339933)
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![tests](https://img.shields.io/badge/tests-169%20passing-2ea44f)
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-0-8338e6)
 
 > **一款可直接落地生产的本地化 AI 智能体工作台。**
 > 终端 CLI + **macOS 桌面应用** + **插件市场**，一套内核、两种形态——把任意 OpenAI 兼容模型，变成能读写文件、执行命令、跨会话持续交付的工程助手。
 
-nano-harness 已完成从 0 到 1 的产品闭环：开箱即用的桌面端与命令行、模型厂商无关、工作区级安全护栏、插件生态，以及一套覆盖 169 个自动化用例的质量体系。它在你的本机与内网内运行，**源代码、API Key 与业务数据始终留在你手里**，不锁定厂商、不依赖云托管，可自由商用与二次开发。
+nano-harness 已完成从 0 到 1 的产品闭环：开箱即用的桌面端与命令行、模型厂商无关、工作区级安全护栏、插件生态，以及一套覆盖关键路径的自动化测试体系。它在你的本机与内网内运行，**源代码、API Key 与业务数据始终留在你手里**，不锁定厂商、不依赖云托管，可自由商用与二次开发。
 
 - **终端 CLI（`nh`）**：交互式多轮会话 / 一次性任务，适合工程师日常与脚本化、CI 化集成
 - **macOS 桌面应用（`npm run desktop`）**：原生窗口、毛玻璃侧栏、深浅色跟随系统，会话 / 文件 / 成果预览 / 插件市场 / 设置一体化
@@ -64,7 +63,7 @@ npm link          # 把 nh 注册为全局命令
 ```bash
 npm run check          # 类型检查 + 构建 + 全部测试（提交前必跑）
 npm run typecheck      # core(tsc) + desktop(tsc) + web(tsc --noEmit)
-npm test               # 构建 + 169 个自动化用例（Node 内置 test runner，零额外依赖）
+npm test               # 构建 + 全量自动化用例（Node 内置 test runner，零额外依赖）
 npm run build:all      # 产出 dist/ + dist-desktop/ + web/dist/
 npm run pack           # 打包 macOS .app（electron-builder）
 npm run smoke:desktop  # 真实 Electron 启动渲染冒烟（需图形会话，不进默认闸门）
@@ -239,7 +238,7 @@ nano-harness 以"默认安全、最小授权、全程可审计"为设计前提�
 | 2 | 权限确认：写文件 / 执行命令前展示内容，默认拒绝，终端与 UI 均可注入决策 | `permission.ts` |
 | 3 | 熔断：单轮最大步数强制刹车并可有界续跑，防止死循环与失控消耗 | `loop.ts` |
 
-**可靠性工程（169 个自动化用例，测试目录与真实配置完全隔离）**
+**可靠性工程（全量自动化用例，测试目录与真实配置完全隔离）**
 
 测试通过 `NANO_HARNESS_HOME` 将配置 / 会话目录指向临时文件夹，绝不触碰真实的
 `~/.nano-harness/`（含 API Key）。覆盖范围：
