@@ -1,6 +1,6 @@
 {
   "name": "nano-harness",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "零依赖、模块化的 AI Agent Harness —— 终端 CLI + macOS 桌面应用 + 成果预览 + 插件市场",
   "type": "module",
   "main": "dist/cli.js",
@@ -11,7 +11,7 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/cli.js', 0o755)\"",
     "build:desktop": "tsc -p desktop/tsconfig.json",
     "build:preload": "esbuild desktop/preload.ts --bundle --platform=node --external:electron --format=cjs --outfile=dist-desktop/preload.cjs",
     "build:ui": "vite build --config web/vite.config.ts",
@@ -23,10 +23,12 @@
     "desktop": "npm run build:all && electron dist-desktop/main.js",
     "ui:dev": "vite dev --config web/vite.config.ts",
     "mock": "node scripts/mock-server.mjs",
-    "prepublishOnly": "npm run build",
-    "test": "npm run build && node --test tests/",
-    "test:only": "node --test tests/",
-    "check": "npm run typecheck && npm run test:only"
+    "prepublishOnly": "npm run check && npm run build:all",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "test:only": "node --test tests/*.test.mjs",
+    "test:e2e": "node --test tests/cli.e2e.test.mjs",
+    "smoke:desktop": "node scripts/desktop-smoke.mjs",
+    "check": "npm run typecheck && npm run build && node --test tests/*.test.mjs"
   },
   "keywords": [
     "ai",

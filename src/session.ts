@@ -13,7 +13,7 @@ import { promises as fs } from 'node:fs';
 import { join, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CONFIG_DIR } from './config.js';
-import type { ChatMessage } from './llm.js';
+import type { ChatMessage, ToolCall } from './llm.js';
 
 const SESSIONS_DIR = join(CONFIG_DIR, 'sessions');
 
@@ -119,14 +119,19 @@ export async function listSessions(limit = 50, archiveFilter: ArchiveFilter = 'h
   const result: SessionInfo[] = [];
   for (const name of names.filter((n) => n.endsWith('.json'))) {
     try {
-      const data = JSON.parse(await fs.readFile(join(SESSIONS_DIR, name), 'utf8')) as SessionFile;
+      const data = JSON.parse(await fs.readFile(join(SESSIONS_DIR, name), 'utf8')) as Partial<SessionFile>;
+      // 载荷也要有最低限度的结构：缺 messages 的半截文件不算合法会话
+      if (!Array.isArray(data.messages)) continue;
+      // 时间字段缺失/损坏时互相兜底，避免排序时 NaN 打乱整个列表
+      const now = new Date().toISOString();
+      const createdAt = typeof data.createdAt === 'string' && data.createdAt ? data.createdAt : now;
       result.push({
         file: name,
-        title: data.title,
-        createdAt: data.createdAt,
-        updatedAt: data.updatedAt ?? data.createdAt,
-        archived: data.archived ?? false,
-        ...(data.workspace ? { workspace: data.workspace } : {}),
+        title: typeof data.title === 'string' && data.title ? data.title : '未命名会话',
+        createdAt,
+        updatedAt: typeof data.updatedAt === 'string' && data.updatedAt ? data.updatedAt : createdAt,
+        archived: data.archived === true,
+        ...(typeof data.workspace === 'string' && data.workspace ? { workspace: data.workspace } : {}),
       });
     } catch {
       // 单个会话文件损坏不碍事，跳过即可——持久化层要有"脏数据免疫力"
@@ -139,7 +144,7 @@ export async function listSessions(limit = 50, archiveFilter: ArchiveFilter = 'h
     .slice(0, limit);
 }
 
-/** 按文件名加载一个会话，返回完整消息历史 */
+/** 按文件名加载一个会话，返回完整消息历史（对坏消息做清洗，保证恢复后能继续发请求） */
 export async function loadSession(name: string): Promise<ChatMessage[]> {
   const raw = await fs.readFile(join(SESSIONS_DIR, safeName(name)), 'utf8');
   const data = JSON.parse(raw) as SessionFile;
@@ -147,13 +152,95 @@ export async function loadSession(name: string): Promise<ChatMessage[]> {
   if (!Array.isArray(data?.messages)) {
     throw new Error(`会话文件格式不正确（缺少 messages 数组）：${name}`);
   }
-  return data.messages;
+  return sanitizeMessages(data.messages);
 }
 
-/** 切换会话归档状态（列表里一行小按钮即可归档/恢复） */
+/**
+ * 清洗对话历史：只保留形状合法的消息，把 content 归一化成字符串。
+ * 磁盘上的会话可能来自旧版本/写入中断/手动编辑，直接发给端点会 400；
+ * runAgentTurn 每轮开始还会再刷新首条 system，所以这里把不合法的首条 system 删掉即可。
+ */
+function sanitizeMessages(input: unknown): ChatMessage[] {
+  if (!Array.isArray(input)) return [];
+  const out: ChatMessage[] = [];
+  for (const m of input as unknown[]) {
+    if (!m || typeof m !== 'object') continue;
+    const msg = m as Record<string, unknown>;
+    const content = typeof msg.content === 'string' ? msg.content : '';
+    switch (msg.role) {
+      case 'system':
+      case 'user':
+        if (content || msg.role === 'user') out.push({ role: msg.role, content });
+        break;
+      case 'assistant': {
+        const calls = Array.isArray(msg.tool_calls)
+          ? (msg.tool_calls as unknown[]).flatMap((c): ToolCall[] => {
+              if (!c || typeof c !== 'object') return [];
+              const tc = c as Record<string, unknown>;
+              const fn = tc.function as Record<string, unknown> | undefined;
+              if (typeof fn?.name !== 'string') return [];
+              return [{
+                id: typeof tc.id === 'string' && tc.id ? tc.id : `restored-${out.length}-${Math.random().toString(36).slice(2, 8)}`,
+                type: 'function',
+                function: { name: fn.name, arguments: typeof fn.arguments === 'string' ? fn.arguments : '{}' },
+              }];
+            })
+          : undefined;
+        out.push(calls && calls.length > 0
+          ? { role: 'assistant', content, tool_calls: calls }
+          : { role: 'assistant', content });
+        break;
+      }
+      case 'tool':
+        // tool 消息必须带 tool_call_id；没有归属的孤儿 tool 会让端点 400，丢弃
+        if (typeof msg.tool_call_id === 'string' && msg.tool_call_id) {
+          out.push({ role: 'tool', tool_call_id: msg.tool_call_id, content });
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  // 二次校正"工具调用组"，保证发出去的历史满足 OpenAI 协议（每个 tool_call 都要有
+  // 紧跟的 tool 结果、每条 tool 都要指向一个真实存在的 call）。写入中断 / 手工编辑 /
+  // 旧版本都可能造成不配对，这类历史恢复后会被端点稳定 400，且永远发不出去。
+  //   1) 收集所有 assistant 声明过的 call id；
+  //   2) 丢弃"孤儿 tool"（tool_call_id 指向一个不存在的 call）；
+  //   3) assistant 上只保留"确实有 tool 结果回应"的 call；一个都没有就转成普通文字。
+  const declaredIds = new Set<string>();
+  for (const m of out) {
+    if (m.role === 'assistant' && m.tool_calls) for (const c of m.tool_calls) declaredIds.add(c.id);
+  }
+  const paired: ChatMessage[] = [];
+  for (const m of out) {
+    if (m.role === 'tool' && !declaredIds.has(m.tool_call_id)) continue; // 孤儿 tool
+    paired.push(m);
+  }
+  const answeredIds = new Set<string>();
+  for (const m of paired) if (m.role === 'tool') answeredIds.add(m.tool_call_id);
+  for (let i = 0; i < paired.length; i++) {
+    const m = paired[i];
+    if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+      const answered = m.tool_calls.filter((c) => answeredIds.has(c.id));
+      paired[i] = answered.length > 0
+        ? { role: 'assistant', content: m.content, tool_calls: answered }
+        : { role: 'assistant', content: m.content };
+    }
+  }
+  // 首条若非 system，不动它——runAgentTurn 会自动补/刷 system。
+  return paired;
+}
+
+/** 切换会话归档状态（列表里一行小按钮即可归档/恢复）。原子写，防止并发保存把文件写花 */
 export async function setSessionArchived(name: string, archived: boolean): Promise<void> {
   const file = join(SESSIONS_DIR, safeName(name));
-  const data = JSON.parse(await fs.readFile(file, 'utf8')) as SessionFile;
+  const data = JSON.parse(await fs.readFile(file, 'utf8')) as Partial<SessionFile>;
+  if (!Array.isArray(data.messages)) {
+    throw new Error(`会话文件格式不正确（缺少 messages 数组）：${name}`);
+  }
   data.archived = archived;
-  await fs.writeFile(file, JSON.stringify(data, null, 2), 'utf8');
+  data.updatedAt = data.updatedAt ?? new Date().toISOString();
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
+  await fs.rename(tmp, file);
 }

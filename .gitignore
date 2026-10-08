@@ -6,6 +6,9 @@ dist/
 .env
 .nano-harness/
 
+# 自改进守护进程的运行状态（journal/backlog/STOP，属本机运行产物）
+.nano-self/
+
 # 日志与系统文件
 *.log
 .DS_Store

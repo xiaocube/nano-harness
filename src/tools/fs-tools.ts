@@ -14,6 +14,7 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { registerTool } from './index.js';
 import type { Tool, ToolContext } from './index.js';
+import { resolveInside as guardPath } from './path-guard.js';
 
 /** 单次返回给模型的最大字符数（约 10k token，够用又不烧钱） */
 const MAX_OUTPUT = 40_000;
@@ -21,62 +22,13 @@ const MAX_OUTPUT = 40_000;
 const MAX_ENTRIES = 500;
 
 /**
- * 路径越界防护：
- * 把模型给的路径解析成绝对路径，然后强制校验它必须位于工作区内部。
- * 接受相对路径（相对工作区解析）和绝对路径，但"逃出"工作区的一律拒绝。
+ * 构造四个文件工具。默认注册时用工作区路径守卫 guardPath；
+ * 自改进守护进程（src/self）会传入"额外禁止写 .git / 自身状态目录"的更严格守卫，
+ * 复用同一套实现而不复制逻辑。
  *
- * @returns 校验通过后的绝对路径
- * @throws 越界时抛错（错误信息会回传给模型，让它自己修正）
+ * @param guard 路径解析+安全边界校验函数（默认 = resolveInside 工作区围栏）
  */
-async function guardPath(workspace: string, userPath: unknown): Promise<string> {
-  if (typeof userPath !== 'string' || !userPath) {
-    throw new Error('路径参数缺失');
-  }
-  const abs = path.resolve(workspace, userPath); // 相对路径 → 以 workspace 为基准解析
-
-  // 用真实路径比对：只做字符串前缀判断的话，工作区里的一个符号链接
-  // （ln -s /etc link）就能把读写带到工作区之外——这是真实的越狱路径。
-  // 目标可能还不存在（新建文件），所以要向上找到最近的已存在祖先再 realpath。
-  const root = await realRoot(workspace);
-  let probe = abs;
-  const tail: string[] = [];
-  for (;;) {
-    try {
-      const real = await fs.realpath(probe);
-      const full = tail.length ? path.join(real, ...tail.reverse()) : real;
-      assertInside(full, root, userPath);
-      return abs;
-    } catch (err) {
-      if ((err as Error).message.startsWith('安全限制')) throw err;
-      const parent = path.dirname(probe);
-      if (parent === probe) {
-        throw new Error(`安全限制：无法解析路径 "${userPath}"`);
-      }
-      tail.push(path.basename(probe));
-      probe = parent;
-    }
-  }
-}
-
-/** 工作区根目录的真实路径（工作区本身也可能是个符号链接） */
-async function realRoot(workspace: string): Promise<string> {
-  try {
-    return await fs.realpath(path.resolve(workspace));
-  } catch {
-    return path.resolve(workspace);
-  }
-}
-
-/** 真实路径必须在工作区内：加分隔符后缀，防止 /workspace-evil 伪装成子目录 */
-function assertInside(realPath: string, root: string, userPath: string): void {
-  if (realPath === root || realPath.startsWith(root + path.sep)) return;
-  throw new Error(
-    `安全限制：路径 "${userPath}" 超出工作区边界。只能操作工作区内的文件（${root}）`,
-  );
-}
-
-/** 四个文件工具的统一注册入口（由 tools/index.ts 调用） */
-export function registerFsTools(): void {
+export function buildFsTools(guard: (workspace: string, userPath: unknown) => Promise<string>): Tool[] {
   /* ---------- read_file ---------- */
   const readFile: Tool = {
     name: 'read_file',
@@ -95,7 +47,7 @@ export function registerFsTools(): void {
     needsPermission: false, // 只读不危险
     describe: (args) => String(args.path ?? ''),
     execute: async (args, ctx) => {
-      const abs = await guardPath(ctx.workspace, args.path);
+      const abs = await guard(ctx.workspace, args.path);
       const content = await fs.readFile(abs, 'utf8');
       // offset/limit 让模型能分段读完大文件（否则尾部永远读不到）
       const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
@@ -127,7 +79,7 @@ export function registerFsTools(): void {
     needsPermission: true, // 覆盖文件 = 破坏性操作
     describe: (args) => `${args.path}（${String(args.content ?? '').length} 字符）`,
     execute: async (args, ctx) => {
-      const abs = await guardPath(ctx.workspace, args.path);
+      const abs = await guard(ctx.workspace, args.path);
       const content = String(args.content ?? '');
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, content, 'utf8');
@@ -153,9 +105,12 @@ export function registerFsTools(): void {
     needsPermission: true,
     describe: (args) => `${args.path}（替换 ${String(args.old_string ?? '').length} 字符片段）`,
     execute: async (args, ctx) => {
-      const abs = await guardPath(ctx.workspace, args.path);
+      const abs = await guard(ctx.workspace, args.path);
       const oldStr = String(args.old_string ?? '');
       const newStr = String(args.new_string ?? '');
+      if (!oldStr) {
+        return '错误：old_string 不能为空。新建文件请用 write_file。';
+      }
       const content = await fs.readFile(abs, 'utf8');
       // 唯一性校验：出现 0 次说明模型记错了原文；出现多次则替换会误伤，都拒绝执行
       const first = content.indexOf(oldStr);
@@ -185,7 +140,7 @@ export function registerFsTools(): void {
     needsPermission: false,
     describe: (args) => String(args.path ?? '.'),
     execute: async (args, ctx) => {
-      const abs = await guardPath(ctx.workspace, args.path ?? '.');
+      const abs = await guard(ctx.workspace, args.path ?? '.');
       const entries = await fs.readdir(abs, { withFileTypes: true });
       if (entries.length === 0) return '(空目录)';
       // 目录排前、文件排后，各按名称排序，模型读起来更省 token
@@ -199,8 +154,14 @@ export function registerFsTools(): void {
     },
   };
 
-  // 把四个工具登记进注册表（注意不能用 forEach(registerTool)，会把索引误当 owner）
-  for (const tool of [readFile, writeFile, editFile, listDir]) {
+  // 返回四个工具（顺序稳定，测试与受限工具集依赖它）
+  return [readFile, writeFile, editFile, listDir];
+}
+
+/** 四个文件工具的统一注册入口（由 tools/index.ts 调用），使用默认工作区围栏 */
+export function registerFsTools(): void {
+  // 注意不能用 forEach(registerTool)，会把索引误当 owner
+  for (const tool of buildFsTools(guardPath)) {
     registerTool(tool);
   }
 }

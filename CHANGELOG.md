@@ -2,6 +2,110 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## v0.5.0 —— 自改进守护进程（让 harness 回合制地优化自身）
+
+新增 `nh self`：一个有预算、有验收、能回滚、可急停的**回合制主管**，让 harness
+在当前 git 仓库内持续做小改进，而不是放任一个 agent `while(true)` 乱跑。
+
+### 用法
+- `nh self run [--attempts N] [--fix-rounds N] [--token-budget N] [--idle-limit N] [--interval MS] [--integrate branch|ff] [--max-steps N] [--turn-continuations N]`
+- `nh self gate`（只跑质量闸门）、`nh self journal`、`nh self backlog list/add/done`、`nh self stop/resume`
+
+### 每个尝试的安全流程
+1. 前置：必须是干净的 git 仓库、非 detached HEAD；有未提交改动直接拒绝（不卷入用户在制工作）；
+   `.nano-self/STOP` 急停标记存在则不开始。
+2. 先跑闸门拿基线；绿 → 做一项小改进；红 → 本轮只负责修绿。
+3. 切 `nano/self/*` 临时分支，用**受限工具集**跑回合：只能读写仓库源码、跑系统固定的
+   `run_check`、只读看 `git_status`；**无 shell、无网络、无装依赖、无提交工具**，
+   且禁止写 `.git / node_modules / dist / package.json / .github`。
+   单轮撞步数上限会带着上文自动续跑（默认再 1 轮），避免改到一半被熔断、成果被回滚。
+4. 改后闸门失败则在限额内修复；仍失败 → `reset --hard` + 清理本次未跟踪文件 + 删临时分支。
+5. 通过且确有改动才由**主管**本地提交；默认只留在 `nano/self/*` 分支等审阅，
+   `--integrate ff` 才快进合并，绝不产生合并提交、绝不 push。
+6. journal + token 预算 + 连续空闲熔断，避免空转烧钱。
+
+### 实现
+- 新增 `src/self/`：`supervisor.ts`（回合编排/预算/回滚）、`git.ts`（execFile 白名单、
+  禁网络动词、分支前缀守卫）、`gate.ts`（固定 argv 闸门，模型无法注入命令）、
+  `self-tools.ts`（受限工具集）、`store.ts`（state/journal/backlog/STOP）、`commands.ts`（CLI）。
+- `runAgentTurn` 支持注入 `tools` 与 `systemPrompt`（默认行为不变）；
+  文件工具重构为 `buildFsTools(guard)` 工厂以便套用更严格的路径守卫。
+- **修复"单轮 25 步到顶被硬停"**：实测 agent 会把步数几乎全耗在并行只读浏览上，还没动手
+  就被熔断。新增 `runAgentTurnWithContinuations` 有界自动续跑——单轮以 `stopReason='max_steps'`
+  结束时复用同一份对话历史、追加"停止浏览、立即收敛完成最小改动"指令再开一轮；
+  CLI / 桌面网页默认最多再续 2 轮（约 3×maxSteps 步封顶），`nh self` 默认再续 1 轮、
+  `--turn-continuations` 可调。中途只发 `max_steps/continuation` 事件不发终态回答，
+  避免网页端把刹车文案误当最终气泡；续跑额度用尽才把刹车文案作为最终回答。
+- 自动化用例 152 → **169**（新增 14 个 self 用例 + 3 个续跑用例：临时 git 仓库 + 脚本化
+  假回合/假闸门，覆盖提交/快进/回滚/空闲/预算/急停/脏工作树/受限守卫/分支删除守卫，
+  以及续跑成功、额度为 0 保留旧行为、额度用尽有界封顶）。
+- 修复实现自改进时发现的两个真实问题：git 白名单误把 `-c key=value` 的值当子命令拒绝；
+  `reset --hard` 不删未跟踪文件导致回滚后残留（已加受控 `cleanUntracked`，遵守 ignore）。
+
+```
+$ npm test
+ℹ tests 169
+ℹ pass 169
+ℹ fail 0
+```
+
+## v0.4.2 —— 发布阻断修复与桌面端安全加固
+
+在 v0.4.x 基础上做了一轮完整测试（类型检查 + 全量用例 + mock 端到端 + 构建链路审计）
+后修复的缺陷。其中第一条会直接导致 npm 全局安装后命令无法启动。
+
+### 修复
+
+- **【发布阻断】全新构建的 CLI 没有可执行位**：`tsc` 产出的 `dist/cli.js` 是 644，
+  而 `dist/` 被 gitignore（权限位不随仓库保留）。发布机全新构建并发布到 npm 后，
+  全局安装得到的 `nh` 没有执行权限、无法启动。现在 build 后显式 `chmod 755`，
+  并让 `prepublishOnly` 一并跑 `build:all`。
+- **桌面端系统提示词会过期**：同一份对话在"切换工作区文件夹 / 切换预设 /
+  从侧栏恢复别的文件夹下的会话"之后继续提问，模型看到的仍是旧目录、旧人设，
+  工具却在新目录里执行。现在主进程每轮发送前都按本轮工作区/预设刷新首条 system
+  （与 CLI `/resume` 的行为对齐）。
+- **会话恢复出"悬空工具调用" → 端点稳定 400**：写入中断 / 手工编辑 / 旧版本可能留下
+  "assistant 声明了 tool_calls 却没有对应 tool 结果"的历史，恢复后永远发不出去。
+  现在加载会话时把无人应答的 tool_calls 剥成普通文字消息。
+- **成果预览拦掉了相对资源**：`nh-file://` 响应的 CSP 只给了 `unsafe-inline`，
+  被预览 HTML 通过相对路径引用的同目录 CSS/JS（README 承诺可用）实际会被拦，
+  多文件页面白屏。补上 `script-src/style-src 'self'`（仍是工作区受限来源，
+  `connect-src 'none'` 依旧封死外联与数据外传）。
+- **`edit_file` 的空 `old_string`**：空串会在任意位置匹配，语义歧义且可能误伤，
+  现在明确拒绝并提示改用 `write_file`。
+- **e2e 版本号硬编码**：`--version` 用例写死 `v0.4.0`，每次发版都红。改为从
+  package.json 动态读取。
+
+### 安全
+
+- **插件市场 GitHub 来源 `subdir` 路径穿越**：旧校验正则放行 `..` 段，
+  `subdir: "../../.."` 可让解压后的 `path.join` 逃出临时目录（Zip Slip 同类），
+  把工作区外任意含 `plugin.json` 的目录装进插件目录。现在与 bundled 来源同一套守卫
+  （拒绝绝对路径与任何 `..` 段）。
+- **桌面 IPC 入参全部白名单校验**：此前渲染层传来的配置补丁、提供商、预设、
+  会话/文件名、插件开关等直接落库或拼路径。`contextIsolation` 只挡"网页直接碰 Node"，
+  挡不住被 XSS / 依赖投毒的渲染层。现在每个影响落盘或 agent 行为的 IPC 都在主进程
+  侧做类型与形状校验，非法输入直接拒绝（配置补丁按字段白名单清洗，提供商 id 限字符集）。
+
+### 工程与测试
+
+- 自动化用例 144 → **152**（新增：悬空工具调用清洗、subdir 穿越、系统提示词刷新、
+  edit_file 空片段、provider 等），`npm test` 全绿。
+- 新增 `scripts/desktop-smoke.mjs` 与 `npm run smoke:desktop`：拉起真实 Electron、
+  利用内置 `NANO_CAPTURE` 钩子截图，验证"启动 → 加载界面 → React 渲染"整条链路
+  （需图形会话，默认不进 `npm test` 闸门）。
+- 纠正文档：此前 README 声称存在"基于 CDP 驱动真实 Electron 的端到端检查"，
+  仓库中实际并无该测试，已改为如实描述现有覆盖；用例数同步更新。
+
+### 测试数据
+
+```
+$ npm test
+ℹ tests 152
+ℹ pass 152
+ℹ fail 0
+```
+
 ## v0.4.0 —— 可发布版（首个"敢给别人用"的版本）
 
 这一版的主题是**把地基补牢**：加了一整套自动化测试（128 个用例），

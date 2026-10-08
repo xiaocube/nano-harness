@@ -13,6 +13,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startMockModel } from './helpers/mock-model.mjs';
 
+/** 版本号以 package.json 为唯一来源：不能在测试里写死，否则一发版就红 */
+const APP_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+
 const home = mkdtempSync(join(tmpdir(), 'nh-cli-home-'));
 const work = mkdtempSync(join(tmpdir(), 'nh-cli-ws-'));
 const CLI = new URL('../dist/cli.js', import.meta.url).pathname;
@@ -42,7 +45,7 @@ describe('cli: 基础命令', () => {
   test('--version 输出版本号并退出 0', async () => {
     const { code, stdout } = await runCli(['--version']);
     assert.equal(code, 0);
-    assert.match(stdout, /nano-harness v0\.4\.0/);
+    assert.match(stdout, new RegExp(`nano-harness v${APP_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   });
 
   test('--help 列出关键参数', async () => {

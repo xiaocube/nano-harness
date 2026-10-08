@@ -1,5 +1,11 @@
 # ⚡ nano-harness
 
+![platform](https://img.shields.io/badge/platform-macOS-000000)
+![node](https://img.shields.io/badge/node-%E2%89%A520-339933)
+![license](https://img.shields.io/badge/license-MIT-blue)
+![tests](https://img.shields.io/badge/tests-169%20passing-2ea44f)
+![runtime deps](https://img.shields.io/badge/runtime%20deps-0-8338e6)
+
 > 一个**零运行时依赖**、模块化的 AI Agent Harness。
 > 终端 CLI + **macOS 桌面应用** + **插件市场**，让你读懂并拥有一个完整的 Agent——Agent = Model + Harness。
 
@@ -18,19 +24,42 @@ nano-harness 用**带中文注释的 TypeScript** 实现了它们共同的核心
 - **模型无关**：OpenAI 兼容协议，DeepSeek / 智谱 GLM / Ollama / 任何兼容端点，改一行配置即切换
 - **macOS 原生体验**：hiddenInset 红绿灯、vibrancy 毛玻璃侧栏、原生菜单、浅色/深色/跟随系统三态主题
 - **插件市场**：插件 = 工具包（与内置工具同构），UI 一键安装；发布 = 向 `marketplace/index.json` 提 PR
-- **安全护栏**：路径越界防护、危险操作人工确认（终端问询 / UI 弹窗）、最大步数熔断
+- **安全护栏**：路径越界防护、危险操作人工确认（终端问询 / UI 弹窗）、最大步数熔断 + 单轮到顶自动续跑（有界，默认最多再续 2 轮，防止"读一堆文件还没动手就被硬停"）
+- **自改进守护进程**：`nh self run` 让 harness 在 git 仓库内回合制地优化自身——先过质量闸门才提交，失败自动回滚，无 shell/无外联/可急停（详见下文）
 - **事件驱动架构**：核心无头化，CLI 与桌面 UI 都是事件的订阅者——任何人都能写自己的订阅者
 - **全程中文注释**：每个文件的开头都讲清楚"这个模块为什么存在、怎么设计的"
+
+## 🖼️ 界面预览
+
+> 以下为 macOS 桌面端实拍（截图中的对话与项目均为演示数据，API Key 只存在本机）。
+
+**对话页：工具执行过程可见，Markdown / 代码块 / 表格直接渲染**
+
+![对话页](docs/images/02-conversation.png)
+
+<p align="center">
+  <img alt="首屏（浅色）" src="docs/images/01-overview-light.png" width="49%" />
+  <img alt="首屏（深色，侧栏为原生毛玻璃）" src="docs/images/06-overview-dark.png" width="49%" />
+</p>
+
+<p align="center">
+  <img alt="文件面板" src="docs/images/03-files.png" width="49%" />
+  <img alt="插件市场" src="docs/images/04-plugins.png" width="49%" />
+</p>
+
+<p align="center">
+  <img alt="设置：外观 / 权限模式 / 最大步数" src="docs/images/05-settings.png" width="72%" />
+</p>
 
 ## 📦 安装
 
 ```bash
 # 方式一：从源码安装（推荐开发者）
-git clone <your-repo-url> && cd nano-harness
+git clone https://github.com/xiaocube/nano-harness.git && cd nano-harness
 npm install && npm run build
 npm link          # 把 nh 挂为全局命令
 
-# 方式二：发布后一行安装（规划中）
+# 方式二：发布到 npm 后一行安装
 npm install -g nano-harness
 ```
 
@@ -41,9 +70,10 @@ npm install -g nano-harness
 ```bash
 npm run check       # 类型检查 + 全部测试（提交前跑这个）
 npm run typecheck   # core(tsc) + desktop(tsc) + web(tsc --noEmit)
-npm test            # 构建 + 128 个自动化用例（Node 内置 test runner，零额外依赖）
+npm test            # 构建 + 169 个自动化用例（Node 内置 test runner，零额外依赖）
 npm run build:all   # 产出 dist/ + dist-desktop/ + web/dist/
 npm run pack        # 打包 macOS .app（electron-builder）
+npm run smoke:desktop  # 拉起真实 Electron 截图冒烟（需图形会话，不进默认测试闸门）
 ```
 
 **测试怎么隔离的**：用例通过 `NANO_HARNESS_HOME` 把配置/会话目录指到临时文件夹，
@@ -59,7 +89,10 @@ npm run pack        # 打包 macOS .app（electron-builder）
 | `tests/bash-tool.test.mjs` | 工作目录、退出码、**超时杀掉整个进程组**、输出截断 |
 | `tests/plugins.test.mjs` | 安装/启用/禁用、**禁用不执行代码**、**插件名注入与越界删除** |
 
-所有面板/弹窗类交互另有基于 Chrome DevTools 协议的端到端检查（驱动真实 Electron 进程）。
+所有面板/弹窗类交互的无头核心逻辑（权限放行/拒绝、超时、会话与工具链路）都由
+`node --test` 覆盖；桌面 GUI 的"能否真正启动并渲染"用 `npm run smoke:desktop`
+做真实 Electron 截图冒烟（利用主进程内置的 `NANO_CAPTURE` 钩子，需要图形会话，
+在本机登录桌面或 macOS CI 上可跑，默认不计入 `npm test` 闸门）。
 
 ## 🚀 快速开始
 
@@ -183,6 +216,44 @@ export default { tools: [hello] };
 - **发布**：把插件放到公开 GitHub 仓库 → 向主仓库 `marketplace/index.json` 提 PR → 合并后全用户可见
 - **参考示例**：`examples/plugins/devtools`（时间/字数统计/系统信息三个工具）
 - ⚠️ v1 插件在 harness 进程内运行（拥有相同权限），安装前请阅读插件源码；沙箱化在路线图中
+
+## 🤖 自改进守护进程（`nh self`）
+
+让 harness 像一个"不知疲倦、但被严格约束的工程师"一样，在**当前这个 git 仓库内**
+持续做小改进。它不是 `while(true)` 让一个 agent 乱跑，而是一个有预算、有验收、
+能回滚、可急停的**回合制主管**。
+
+```bash
+nh self run                 # 跑一段自改进会话（默认最多 3 次尝试）
+nh self run --attempts 10 --token-budget 300000
+nh self gate                # 只跑一次质量闸门（= npm run check）
+nh self backlog add "给 X 补边界测试"   # 投放指定改进任务（优先于内置维护任务）
+nh self journal             # 查看它都干了什么
+nh self stop                # 急停；nh self resume 解除
+```
+
+每个"尝试（attempt）"的流程：
+
+1. **前置安全**：必须在干净的 git 仓库、非 detached HEAD；工作树有未提交改动会直接拒绝
+   （绝不把你的在制工作卷进自动提交）；检测到 `.nano-self/STOP` 急停标记就不开始。
+2. **先跑闸门拿基线**：闸门绿 → 做一项小改进；闸门本来就红 → 这一轮唯一任务是修绿。
+3. **切 `nano/self/*` 临时分支**，用**受限工具集**跑 agent：只能读写仓库源码、
+   跑系统固定的 `run_check`、只读看 `git_status`；**没有 shell、不能联网、不能装依赖、
+   不能自己提交**，也不许写 `.git / node_modules / dist / package.json / .github`。
+   单轮撞步数上限会带着上文**自动续跑**（默认再 1 轮，可用 `--turn-continuations` 调，
+   `--max-steps` 控单轮步数），避免改到一半被步数熔断、成果被回滚。
+4. **再跑闸门**：失败就在限额内（`--fix-rounds`）让它修；仍失败 → `reset --hard`
+   + 清理本次未跟踪文件，硬回滚到原提交并删掉临时分支。
+5. **通过且确有改动 → 由主管（不是模型）add + 本地提交**。默认只提交到 `nano/self/*`
+   分支等你审阅（`git merge` 或直接丢弃都随你）；加 `--integrate ff` 才会**快进合并**
+   进当前分支，绝不产生合并提交、绝不 `push`。
+6. 记结构化日志（`.nano-self/journal.jsonl`）、累计 token 与连续空闲次数；
+   token 超预算或连续若干次"没有安全可做的改进"就自动收工，避免空转烧钱。
+
+> 安全边界：只本地提交，**不外联、不 push、不发布、不安装依赖**；所有自动改动都必须
+> 让 `npm run check`（类型检查 + 构建 + 全部测试）保持通过，且禁止靠删/弱化测试"造绿"。
+> 因此请在**已 `npm install`（含 devDependencies）的源码检出**里运行，而非全局安装的产物目录。
+> 想让它开机常驻，可再用 launchd 定时调用 `nh self run`（当前版本先手动运行）。
 
 ## 🧠 架构：核心 + 双外壳
 

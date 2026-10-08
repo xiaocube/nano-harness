@@ -125,6 +125,8 @@ export type AgentEventPayload =
   | { type: 'tool_call'; step: number; maxSteps: number; name: string; summary: string; target?: string }
   | { type: 'tool_result'; name: string; preview: string }
   | { type: 'tool_denied'; name: string }
+  | { type: 'max_steps'; maxSteps: number }
+  | { type: 'continuation'; index: number; max: number }
   | { type: 'answer'; answer: string }
   | (PermissionPayload & { type: 'permission_request' });
 
@@ -398,7 +400,7 @@ function createMockAPI(): NanoharnessAPI {
       return { ok: true, message: `${enabled ? '已启用' : '已禁用'} ${name}（Mock）` };
     },
     async revealPluginsDir() { return { ok: true }; },
-    async getAppInfo() { return { workspace: store.workspace, version: '0.4.0' }; },
+    async getAppInfo() { return { workspace: store.workspace, version: '0.5.0' }; },
   };
 }
 

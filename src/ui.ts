@@ -6,6 +6,8 @@
  * ANSI 转义码是终端的"控制指令"，形如 \x1b[31m（31 = 红色），\x1b[0m（重置）。
  */
 
+import { APP_VERSION } from './version.js';
+
 /** ANSI 颜色码常量表 */
 const CODES = {
   reset: '\x1b[0m',
@@ -70,12 +72,13 @@ export function startSpinner(text: string): { stop: (finalText?: string) => void
 }
 
 /** 启动横幅：告诉用户"我是谁、当前用什么模型、怎么获得帮助" */
-export function banner(model: string, workspace: string, yolo: boolean): void {
+export function banner(model: string, workspace: string, yolo: boolean, presetLabel = '标准模式'): void {
   console.log('');
-  console.log(C.cyan('  ⚡ nano-harness v0.4.0 ') + C.gray('—— 你的第一个 AI Agent Harness'));
+  console.log(C.cyan(`  ⚡ nano-harness v${APP_VERSION} `) + C.gray('—— 你的第一个 AI Agent Harness'));
   console.log(C.gray('  Agent = Model + Harness，模型是马，harness 是缰绳。'));
   console.log('');
   console.log(`  ${C.gray('模型     ')}${C.bold(model)}`);
+  console.log(`  ${C.gray('模式     ')}${C.bold(presetLabel)}`);
   console.log(`  ${C.gray('工作目录 ')}${C.bold(workspace)}`);
   if (yolo) console.log(`  ${C.yellow('⚠ YOLO 模式：所有工具调用自动放行，不再逐条确认')}`);
   console.log('');

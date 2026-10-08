@@ -50,7 +50,9 @@ export function registerBashTool(): void {
         // 'close' 事件永远不来，超时形同虚设（agent 会卡到天荒地老）。
         const child = spawn('bash', ['-c', command], {
           cwd: ctx.workspace,
-          env: { ...process.env, NANO_HARNESS: '1' }, // 让被调用的程序知道自己在 agent 环境里
+          // 让被调用的程序知道自己在 agent 环境里；
+          // WORKSPACE 变量方便脚本/钩子无需自己推导当前项目根目录
+          env: { ...process.env, NANO_HARNESS: '1', NANO_HARNESS_WORKSPACE: ctx.workspace },
           detached: true,
         });
 

@@ -77,6 +77,26 @@ function explainStatus(status: number, body: string): string {
   }
 }
 
+/** 值得重试的瞬时网络错误码（对端没起来/抖动/DNS 临时失败；401/404 这类不在此列） */
+const RETRIABLE_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH',
+]);
+
+/**
+ * 判断一个 fetch 错误是否值得重试。
+ * undici 的网络错误是 TypeError("fetch failed") + `cause.code`（如 ECONNREFUSED），
+ * AbortSignal.timeout() 则可能给出 name='TimeoutError'；只匹配英文 message
+ * （"timeout"/"fetch failed"）会漏掉非英文环境与只挂在 cause 上的错误码。
+ */
+function isRetriableError(err: unknown): boolean {
+  const e = err as { name?: string; message?: string; cause?: { code?: string } } | null | undefined;
+  if (e?.name === 'TimeoutError') return true;
+  const code = e?.cause?.code;
+  if (code && RETRIABLE_CODES.has(code)) return true;
+  const msg = String(e?.message ?? '').toLowerCase();
+  return msg.includes('timeout') || msg.includes('fetch failed') || msg.includes('networkerror');
+}
+
 /**
  * 调用模型：POST {baseUrl}/chat/completions
  *
@@ -149,10 +169,8 @@ export async function callChat(
       };
     } catch (err) {
       lastError = err as Error;
-      const msg = (err as Error).message ?? '';
-      // 网络层错误（超时/断连）才值得重试；协议层错误（401/404）重试也没用
-      const retriable = msg.includes('timeout') || msg.includes('fetch failed') || msg.includes('ECONNRESET');
-      if (!retriable || attempt === retries) break;
+      // 网络层错误（超时/断连/DNS 抖动）才值得重试；协议层错误（401/404）重试也没用
+      if (!isRetriableError(err) || attempt === retries) break;
       await new Promise((r) => setTimeout(r, (attempt + 1) * 2000));
     }
   }

@@ -112,6 +112,18 @@ export default function ChatPage({ onTurnDone, onPreview }: { onTurnDone: () => 
         case 'compacted':
           setItems((xs) => [...xs, { kind: 'notice', key: itemSeq++, text: '上下文已压缩' }]);
           break;
+        case 'max_steps':
+          // 单轮到顶：外层会自动续跑，这里不收尾；续跑也耗尽时才会收到 answer。
+          break;
+        case 'continuation':
+          setItems((xs) => [...xs, {
+            kind: 'notice',
+            key: itemSeq++,
+            text: evt.index >= evt.max
+              ? `已自动续跑 ${evt.max} 次仍在进行，开始最后一轮并收敛…`
+              : `单轮已达步数上限，自动续跑（${evt.index}/${evt.max}），带着上文继续…`,
+          }]);
+          break;
         case 'answer':
           setItems((xs) => [...xs, { kind: 'assistant', key: itemSeq++, text: evt.answer }]);
           setRunning(false);

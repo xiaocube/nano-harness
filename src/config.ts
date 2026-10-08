@@ -174,11 +174,33 @@ export async function loadConfig(): Promise<HarnessConfig> {
     }
     // 提供商列表与激活项（v0.3 多提供商）
     if (Array.isArray(raw.providers) && raw.providers.length > 0) {
-      cfg.providers = raw.providers.filter(
-        (p) => p && typeof p.id === 'string' && typeof p.baseUrl === 'string',
-      );
-      cfg.activeProviderId =
-        typeof raw.activeProviderId === 'string' ? raw.activeProviderId : cfg.providers[0]?.id;
+      // 严格校验 + 归一化：id/baseUrl/model 必须是非空字符串，
+      // name/apiKey 缺失时补默认值；同一 id 出现多次只保留第一个（防脏数据搞花 UI）。
+      const seen = new Set<string>();
+      const list: ModelProvider[] = [];
+      for (const p of raw.providers) {
+        if (!p || typeof p !== 'object') continue;
+        const cand = p as Partial<ModelProvider>;
+        if (typeof cand.id !== 'string' || !cand.id.trim()) continue;
+        if (typeof cand.baseUrl !== 'string' || !cand.baseUrl.trim()) continue;
+        if (typeof cand.model !== 'string' || !cand.model.trim()) continue;
+        if (seen.has(cand.id)) continue;
+        seen.add(cand.id);
+        list.push({
+          id: cand.id,
+          name: typeof cand.name === 'string' && cand.name.trim() ? cand.name : cand.id,
+          baseUrl: cand.baseUrl,
+          apiKey: typeof cand.apiKey === 'string' ? cand.apiKey : '',
+          model: cand.model,
+        });
+      }
+      if (list.length > 0) {
+        cfg.providers = list;
+        // active 必须真的指向列表中的某个 id；指向已删除提供商的脏 id 要回落到第一个
+        cfg.activeProviderId = list.some((p) => p.id === raw.activeProviderId)
+          ? raw.activeProviderId
+          : list[0].id;
+      }
     }
     if (raw.activePreset === 'standard' || raw.activePreset === 'minimal' || raw.activePreset === 'creative') {
       cfg.activePreset = raw.activePreset;

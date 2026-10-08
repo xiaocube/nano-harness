@@ -195,4 +195,23 @@ describe('plugins: 工具归属', () => {
   });
 });
 
+describe('plugins: GitHub 来源路径守卫', () => {
+  test('subdir 含 ".." 段时拒绝（在发网络请求之前）', async () => {
+    const res = await installFromEntry({
+      name: 'trav', title: 't', description: '', author: '', version: '1',
+      source: { type: 'github', repo: 'some/repo', subdir: '../../..' },
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.message, /子目录/);
+  });
+
+  test('subdir 为绝对路径时拒绝', async () => {
+    const res = await installFromEntry({
+      name: 'trav2', title: 't', description: '', author: '', version: '1',
+      source: { type: 'github', repo: 'some/repo', subdir: '/etc' },
+    });
+    assert.equal(res.ok, false);
+  });
+});
+
 void readFileSync;

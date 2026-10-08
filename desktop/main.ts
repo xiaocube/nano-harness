@@ -91,7 +91,9 @@ function createWindow(): void {
     mainWindow?.show();
     // 自动化验收钩子：设置 NANO_CAPTURE=path 时，稳定后截图并退出（CI/回归用）
     const capturePath = process.env.NANO_CAPTURE;
-    if (capturePath) {
+    if (process.env.NANO_CAPTURE_SCRIPT) {
+      void runCaptureScript(mainWindow!, process.env.NANO_CAPTURE_SCRIPT);
+    } else if (capturePath) {
       setTimeout(() => {
         void mainWindow?.webContents.capturePage().then((image) => {
           fs.writeFileSync(capturePath, image.toPNG());
@@ -101,6 +103,104 @@ function createWindow(): void {
     }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+/**
+ * 多页自动截图钩子（仅当设置了 NANO_CAPTURE_SCRIPT=<json 路径> 时启用）。
+ *
+ * 这是给 README / 发布物料准备截图用的"无人值守导游"：按脚本顺序在渲染层里
+ * 点击导航、加载示例会话、逐页 capturePage，最后退出。它【只在该环境变量存在时运行】，
+ * 正常启动完全不受影响。
+ *
+ * 脚本是一个步骤数组，每步形如：
+ *   { "op": "wait", "ms": 600 }
+ *   { "op": "clickText", "text": "插件市场" }   // 点击文本精确匹配的可点元素
+ *   { "op": "loadSession", "file": "xxx.json" } // 经 IPC 加载示例会话并通知界面刷新
+ *   { "op": "shot", "path": "/abs/xx.png" }
+ *   { "op": "js", "code": "..." }               // 在渲染层执行任意表达式（高级用法）
+ */
+type CaptureStep =
+  | { op: 'wait'; ms?: number }
+  | { op: 'clickText'; text: string }
+  | { op: 'loadSession'; file: string }
+  | { op: 'shot'; path: string }
+  | { op: 'js'; code: string };
+
+async function runCaptureScript(win: BrowserWindow, scriptPath: string): Promise<void> {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  try {
+    const steps = JSON.parse(fs.readFileSync(scriptPath, 'utf8')) as CaptureStep[];
+    await sleep(1800); // 首屏 React 挂载 + 字体稳定
+    for (const step of steps) {
+      try {
+        await performCaptureStep(win, step, sleep);
+      } catch (err) {
+        // 单步失败不连累其余截图：记录后继续
+        console.warn(`[capture] 步骤失败（${step.op}）：`, (err as Error).message);
+        await sleep(300);
+      }
+    }
+  } catch (err) {
+    console.error('[capture] 截图脚本执行失败：', err);
+  } finally {
+    app.quit();
+  }
+}
+
+async function performCaptureStep(
+  win: BrowserWindow,
+  step: CaptureStep,
+  sleep: (ms: number) => Promise<unknown>,
+): Promise<void> {
+  switch (step.op) {
+    case 'wait':
+      await sleep(step.ms ?? 500);
+      break;
+    case 'clickText': {
+      const status = await win.webContents.executeJavaScript(`
+        (() => {
+          try {
+            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+            const want = norm(${JSON.stringify(step.text)});
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, li, div, span'))
+              .filter((n) => n instanceof HTMLElement);
+            let el = nodes.find((n) => norm(n.textContent) === want)
+                   || nodes.find((n) => norm(n.textContent).startsWith(want));
+            if (!el) return 'NOTFOUND';
+            const clickable = el.closest('button, [role="button"], a, li') || el;
+            (clickable as HTMLElement).click();
+            return 'OK';
+          } catch (e) { return 'THROW:' + (e && e.message); }
+        })()
+      `) as string;
+      if (status !== 'OK') console.warn(`[capture] 点击「${step.text}」失败：${status}`);
+      await sleep(800);
+      break;
+    }
+    case 'loadSession':
+      await win.webContents.executeJavaScript(`
+        (async () => {
+          const r = await window.nanoharness.loadSession(${JSON.stringify(step.file)});
+          window.dispatchEvent(new Event('session-loaded'));
+          return r.ok;
+        })()
+      `);
+      await sleep(700);
+      break;
+    case 'js': {
+      const r = await win.webContents.executeJavaScript(step.code);
+      console.log('[capture:js]', typeof r === 'string' ? r : JSON.stringify(r));
+      await sleep(500);
+      break;
+    }
+    case 'shot': {
+      const img = await win.webContents.capturePage();
+      fs.mkdirSync(path.dirname(step.path), { recursive: true });
+      fs.writeFileSync(step.path, img.toPNG());
+      await sleep(300);
+      break;
+    }
+  }
 }
 
 /** 原生应用菜单：用标准 role 换来 macOS 用户习惯的全套行为与快捷键 */
@@ -132,7 +232,10 @@ function setupThemeBridge(): void {
   nativeTheme.on('updated', broadcast);
   // 设置页里用户切换"跟随系统/浅色/深色"时改 themeSource，同样广播生效
   ipcMain.handle('theme:get', () => ({ dark: nativeTheme.shouldUseDarkColors }));
-  ipcMain.handle('theme:set', (_e, mode: 'system' | 'light' | 'dark') => {
+  ipcMain.handle('theme:set', (_e, mode: unknown) => {
+    if (mode !== 'system' && mode !== 'light' && mode !== 'dark') {
+      return { dark: nativeTheme.shouldUseDarkColors };
+    }
     nativeTheme.themeSource = mode;
     return { dark: nativeTheme.shouldUseDarkColors };
   });

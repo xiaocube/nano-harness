@@ -16,15 +16,23 @@ import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { C, banner, printAnswer, startSpinner, printToolCall, printToolResult, printUsage } from './ui.js';
-import { loadConfig, saveConfig, configExists, isConfigUsable, getActiveProvider, PRESETS, type HarnessConfig } from './config.js';
+import { loadConfig, saveConfig, configExists, isConfigUsable, getActiveProvider, PRESETS, type HarnessConfig, type AgentPreset } from './config.js';
 import { registerBuiltinTools, listTools } from './tools/index.js';
-import { runAgentTurn, PRESET_DEFS, type LoopOptions, type AgentEvent } from './loop.js';
+import { runAgentTurnWithContinuations, PRESET_DEFS, refreshSystemPrompt, type ContinuableLoopOptions, type AgentEvent } from './loop.js';
 import { setAskQuestion } from './permission.js';
 import { saveSession, listSessions, loadSession } from './session.js';
 import { loadInstalledPlugins } from './plugins.js';
 import type { ChatMessage } from './llm.js';
+import { APP_VERSION } from './version.js';
+import { runSelfCommand } from './self/commands.js';
 
-const VERSION = '0.4.0';
+const VERSION = APP_VERSION;
+
+/**
+ * 单轮撞 maxSteps 后最多自动续跑几轮。默认 2：一个任务最多约 3 × maxSteps 个模型回合
+ * （maxSteps 默认 25，即约 75 步）仍未完成就收工，防止空转烧钱。
+ */
+const DEFAULT_CONTINUATIONS = 2;
 
 /**
  * 把核心事件翻译成终端渲染——CLI 是核心事件的第一个订阅者。
@@ -56,6 +64,13 @@ function makeTerminalSubscriber(): (evt: AgentEvent) => void {
       case 'tool_denied':
         console.log(C.gray(`  ↳ ${evt.name} 被用户拒绝`));
         break;
+      case 'max_steps':
+        break; // 是否续跑由外层决定；续跑会单独提示，耗尽则最终回答即制动文案
+      case 'continuation':
+        spinner?.stop();
+        spinner = null;
+        console.log(C.cyan(`\n  ↻ 单轮已达 ${evt.max === evt.index ? '续跑上限，进行最后一轮' : `步数上限，自动续跑（${evt.index}/${evt.max}）`}：已带着上文继续，请收敛并立即完成手头最小改动…`));
+        break;
       case 'answer':
         break; // 最终回答由调用方拿返回值统一渲染
     }
@@ -72,6 +87,15 @@ function printHelp(): void {
     nh                     交互模式（REPL，支持多轮对话）
     nh "<任务>"            一次性任务模式（跑完自动退出）
     nh --resume            从上次的会话继续
+    nh self ...            自改进守护进程（让 harness 在 git 仓库内持续优化自身）
+
+  自改进（无人值守，默认只在 nano/self/* 分支本地提交、不外联）:
+    nh self run            运行一段自改进会话（先过质量闸门才提交，失败自动回滚）
+    nh self gate           只跑一次质量闸门
+    nh self backlog ...    管理改进待办（list / add / done）
+    nh self journal        查看自改进记录
+    nh self stop/resume    急停 / 解除急停
+    （完整选项见 nh self help）
 
   常用参数:
     --dir <path>           指定工作区目录（默认当前目录）
@@ -80,6 +104,8 @@ function printHelp(): void {
     --api-key <key>        临时覆盖 API Key（更推荐用环境变量）
     --yolo                 跳过所有权限确认（仅建议在沙箱/容器中使用）
     --no-yolo              强制打开权限确认（覆盖配置里的 yolo）
+    --preset <standard|minimal|creative>
+                           指定 Agent 预设（默认读配置，缺省 standard）
     --reconfigure          重新跑一遍配置向导
     --help                 显示本帮助
     --version              显示版本号
@@ -183,6 +209,7 @@ async function handleCommand(
   messages: ChatMessage[],
   cfg: HarnessConfig,
   workspace: string,
+  preset: AgentPreset,
 ): Promise<'exit' | 'handled' | 'task'> {
   const [cmd, ...rest] = input.trim().split(/\s+/);
   const arg = rest.join(' ');
@@ -270,12 +297,9 @@ async function handleCommand(
       const loaded = await loadSession(chosen.file);
       messages.length = 0;
       messages.push(...loaded);
-      // 恢复的历史里带着旧会话的 system 提示词（里面有旧的工作目录/预设）。
-      // 现在的工作区可能已经变了，必须换掉，否则模型会去操作已被围栏挡住的老路径。
-      const sysIdx = messages.findIndex((m) => m.role === 'system');
-      const freshSystem = PRESET_DEFS[cfg.activePreset ?? 'standard'].system(workspace);
-      if (sysIdx >= 0) messages[sysIdx] = { role: 'system', content: freshSystem };
-      else messages.unshift({ role: 'system', content: freshSystem });
+      // 恢复的历史带着旧会话的 system（旧工作目录/预设）。用当前设置刷新它，
+      // 否则模型可能去操作被当前围栏挡住的老路径，或沿用上一个预设的人设/工具面。
+      refreshSystemPrompt(messages, preset, workspace);
       console.log(C.green(`  ✓ 已恢复会话「${chosen.title}」（${loaded.length} 条消息），接着聊即可。`));
       return 'handled';
     }
@@ -296,6 +320,12 @@ async function handleCommand(
 /* ---------------- 主流程 ---------------- */
 
 async function main(): Promise<void> {
+  // `nh self ...` 走独立的自改进守护进程入口（参数体系不同，在 parseArgs 之前分流）
+  if (process.argv[2] === 'self') {
+    process.exitCode = await runSelfCommand(process.argv.slice(3));
+    return;
+  }
+
   // 参数解析：allowPositionals 允许接收位置参数（即"一次性任务"文本）
   const { values, positionals } = parseArgs({
     allowPositionals: true,
@@ -309,6 +339,7 @@ async function main(): Promise<void> {
       help: { type: 'boolean', default: false },
       version: { type: 'boolean', default: false },
       'reconfigure': { type: 'boolean', default: false },
+      preset: { type: 'string' },
     },
   });
 
@@ -323,6 +354,16 @@ async function main(): Promise<void> {
   // --yolo 打开；--no-yolo 显式关掉配置里的 yolo（CI 里想强制每次确认时用得上）
   if (values['no-yolo']) cfg.yolo = false;
   else if (values.yolo) cfg.yolo = true;
+
+  // Agent 预设：--preset 优先（校验非法值），否则用配置里持久化的选择
+  const preset: AgentPreset = (() => {
+    const p = values.preset ?? cfg.activePreset ?? 'standard';
+    if (p !== 'standard' && p !== 'minimal' && p !== 'creative') {
+      console.log(C.yellow(`  ⚠ 未知预设 "${p}"，回落到 standard（可选：standard / minimal / creative）`));
+      return 'standard';
+    }
+    return p;
+  })();
   // v0.3 多提供商：CLI 临时参数必须同步进"当前提供商"，
   // 否则 callChat 走 getActiveProvider 会绕过 --base-url/--api-key/--model
   {
@@ -361,9 +402,9 @@ async function main(): Promise<void> {
   if (positionals.length > 0) {
     const task = positionals.join(' ');
     const messages: ChatMessage[] = [];
-    const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo, onEvent: makeTerminalSubscriber() };
+    const loopOpts: ContinuableLoopOptions = { cfg, workspace, yolo: cfg.yolo, preset, maxContinuations: DEFAULT_CONTINUATIONS, onEvent: makeTerminalSubscriber() };
     try {
-      const { answer, messages: updated } = await runAgentTurn(messages, task, loopOpts);
+      const { answer, messages: updated } = await runAgentTurnWithContinuations(messages, task, loopOpts);
       printAnswer(answer);
       // 记下工作区：桌面端侧栏据此把会话挂到对应文件夹下
       await saveSession(updated, undefined, workspace);
@@ -417,9 +458,9 @@ async function main(): Promise<void> {
   const messages: ChatMessage[] = [];
   /** 当前会话文件名：首轮保存后固定，之后每轮更新同一个文件（否则 /sessions 里全是碎片） */
   let sessionFile: string | undefined;
-  const loopOpts: LoopOptions = { cfg, workspace, yolo: cfg.yolo, onEvent: makeTerminalSubscriber() };
+  const loopOpts: ContinuableLoopOptions = { cfg, workspace, yolo: cfg.yolo, preset, maxContinuations: DEFAULT_CONTINUATIONS, onEvent: makeTerminalSubscriber() };
 
-  banner(cfg.model, workspace, cfg.yolo);
+  banner(cfg.model, workspace, cfg.yolo, PRESET_DEFS[preset].label);
 
   for (;;) {
     let input: string;
@@ -429,7 +470,7 @@ async function main(): Promise<void> {
     if (!input) continue;
 
     if (input.startsWith('/')) {
-      const verdict = await handleCommand(input, messages, cfg, workspace);
+      const verdict = await handleCommand(input, messages, cfg, workspace, preset);
       if (verdict === 'exit') {
         console.log(C.gray('（会话已自动保存）'));
         break;
@@ -439,7 +480,7 @@ async function main(): Promise<void> {
 
     // 把任务交给 Agent Loop，跑完把"最新历史"取回来（runAgentTurn 原地更新 messages）
     try {
-      const { answer, messages: updated } = await runAgentTurn(messages, input, loopOpts);
+      const { answer, messages: updated } = await runAgentTurnWithContinuations(messages, input, loopOpts);
       printAnswer(answer);
       // 每轮自动落盘：任何时候退出都不丢对话（更新同一个文件，并记下工作区）
       sessionFile = await saveSession(updated, sessionFile, workspace);

@@ -147,6 +147,13 @@ describe('tools: 读写与编辑', () => {
     assert.match(out, /出现了多次/);
     assert.equal(readFileSync(join(work, 'e3.txt'), 'utf8'), 'aa bb aa');
   });
+
+  test('edit_file 的 old_string 为空时明确拒绝（空串会在任意位置匹配）', async () => {
+    await run('write_file', { path: 'e4.txt', content: 'keep me' });
+    const out = await run('edit_file', { path: 'e4.txt', old_string: '', new_string: 'x' });
+    assert.match(out, /old_string 不能为空/);
+    assert.equal(readFileSync(join(work, 'e4.txt'), 'utf8'), 'keep me', '文件不得被改动');
+  });
 });
 
 describe('tools: list_dir', () => {

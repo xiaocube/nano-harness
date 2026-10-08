@@ -14,13 +14,16 @@
 import { ipcMain, shell, dialog, BrowserWindow, app, protocol } from 'electron';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { runAgentTurn, type AgentEvent } from '../dist/loop.js';
+import { runAgentTurnWithContinuations, refreshSystemPrompt, type AgentEvent } from '../dist/loop.js';
 import type { ChatMessage } from '../dist/llm.js';
 import { homedir } from 'node:os';
-import { loadConfig, saveConfig, getActiveProvider, CONFIG_FILE, type HarnessConfig, type ModelProvider, type AgentPreset } from '../dist/config.js';
+import { loadConfig, saveConfig, getActiveProvider, CONFIG_FILE, type HarnessConfig } from '../dist/config.js';
+// IPC 入参白名单校验放在 core（纯数据、零 Electron 依赖），既复用又能被 node:test 覆盖
+import { asPreset, sanitizeConfigPatch, sanitizeProvider } from '../dist/ipc-validation.js';
 import { saveSession, listSessions, loadSession, setSessionArchived } from '../dist/session.js';
 import { registerBuiltinTools, listTools } from '../dist/tools/index.js';
+import { resolveInside } from '../dist/tools/path-guard.js';
+import { APP_VERSION } from '../dist/version.js';
 import { setConfirmHandler, type PermissionRequest } from '../dist/permission.js';
 import {
   loadInstalledPlugins, fetchMarketplace, installFromEntry, uninstallPlugin,
@@ -74,17 +77,12 @@ function isDirectory(p: string): boolean {
 }
 
 /**
- * 应用版本号。开发模式（electron dist-desktop/main.js）下 app.getVersion()
- * 返回的是 Electron 自己的版本（如 44.6.0），会把侧栏显示成 "v44.6.0"，
- * 所以优先直接读项目 package.json，读不到才回落到 Electron 的接口。
+ * 应用版本号。统一来自 src/version.ts（读 package.json，读不到有兜底）：
+ * 开发模式（electron dist-desktop/main.js）下 app.getVersion() 返回的是
+ * Electron 自己的版本（如 44.6.0），不能直接用，否则侧栏会显示成 "v44.6.0"。
  */
 function projectVersion(): string {
-  try {
-    const pkg = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
-    return (JSON.parse(fs.readFileSync(pkg, 'utf8')) as { version?: string }).version ?? app.getVersion();
-  } catch {
-    return app.getVersion();
-  }
+  return APP_VERSION || app.getVersion();
 }
 
 /** 把任意输入规整成一个可用的工作区绝对路径（不存在则回落到当前/默认） */
@@ -95,18 +93,24 @@ function normalizeWorkspace(input: unknown): string {
   return isDirectory(workspace) ? workspace : FALLBACK_WORKSPACE;
 }
 
+/* ---------------- IPC 入参校验（渲染层永远不可信，哪怕它是我们自己的 UI） ----------------
+ * contextIsolation 只挡住"网页直接碰 Node"，挡不住被 XSS / 依赖投毒的渲染层，
+ * 因此每个会落盘或影响 agent 行为的 IPC 都要在主进程侧再校验一次形状。
+ * 通用白名单（预设 / 配置补丁 / 提供商）复用 core 的 ipc-validation（可被单测覆盖）；
+ * 下面是仅本桥使用的少量局部校验。
+ */
+
+const ARCHIVE_FILTER_VALUES: ReadonlySet<string> = new Set(['hide', 'all', 'only']);
+
 /**
  * 工作区内的路径守卫：相对路径 → 绝对路径，并强制留在工作区内。
- * 与 tools/fs-tools.ts 的 guardPath 同源——文件浏览、预览、nh-file 协议都走它。
+ * 与文件工具共用 src/tools/path-guard.ts 的同一实现：用 **realpath** 比对，
+ * 工作区里指向外部的符号链接（ln -s /etc link）同样会被拒绝——
+ * 只做字符串前缀判断的话，那就是一条"读取任意文件"的越狱通道。
+ * 文件浏览、预览、nh-file 协议全部经过这里。
  */
-function safeWorkspacePath(rel: unknown): string {
-  const input = typeof rel === 'string' && rel ? rel : '.';
-  const abs = path.resolve(workspace, input);
-  const root = path.resolve(workspace);
-  if (abs !== root && !abs.startsWith(root + path.sep)) {
-    throw new Error(`路径超出工作区：${input}`);
-  }
-  return abs;
+function safeWorkspacePath(rel: unknown): Promise<string> {
+  return resolveInside(workspace, rel ?? '.');
 }
 
 /** 预览时按什么渲染一个文件 */
@@ -254,14 +258,22 @@ export function createAgentBridge(broadcast: Broadcast): void {
       }, PERMISSION_TIMEOUT_MS).unref?.();
     });
   });
-  ipcMain.on('agent:permission:reply', (_e, reply: { id: number; allowed: boolean }) => {
-    settlePermission(reply.id, reply.allowed);
+  ipcMain.on('agent:permission:reply', (_e, reply: unknown) => {
+    // 渲染层理论上只会回 {id, allowed}，仍做一次形状校验，防止畸形 IPC 让主进程抛异常
+    if (!reply || typeof reply !== 'object') return;
+    const { id, allowed } = reply as { id?: unknown; allowed?: unknown };
+    if (typeof id !== 'number' || typeof allowed !== 'boolean') return;
+    settlePermission(id, allowed);
   });
   /** 界面重新挂载（切页面回来 / Cmd+R）后主动来取还没回答的请求 */
   ipcMain.handle('permission:pending', () => [...pendingPayloads.values()]);
 
   /* ---------- 对话 ---------- */
-  ipcMain.handle('agent:send', async (_e, task: string, opts?: { workspace?: string; preset?: AgentPreset }) => {
+  ipcMain.handle('agent:send', async (_e, task: unknown, opts?: { workspace?: string; preset?: string }) => {
+    if (typeof task !== 'string' || !task.trim()) return { ok: false, error: '任务内容不能为空' };
+    if (opts !== undefined && (typeof opts !== 'object' || opts === null || Array.isArray(opts))) {
+      return { ok: false, error: '非法的任务参数' };
+    }
     if (running) return { ok: false, error: '已有任务在执行中，请等待完成或新建会话' };
     running = true;
     // 注意 try 必须从 running = true 之后立刻开始：await ready / loadConfig 也可能抛
@@ -273,11 +285,21 @@ export function createAgentBridge(broadcast: Broadcast): void {
       // 本轮的工作区：渲染层可以带一个（composer 选择过的），但必须重新校验；
       // 校验不过就用主进程持有的当前工作区——渲染层永远不能直接决定路径边界。
       const turnWorkspace = normalizeWorkspace(opts?.workspace ?? workspace);
-      const result = await runAgentTurn(messages, task, {
+      // 渲染层传来的预设必须是合法三态之一，非法值忽略并回落到配置（而不是把脏值存进历史）
+      const turnPreset = asPreset(opts?.preset) ?? cfg.activePreset;
+      // 每轮发送前都按"本轮实际的工作区/预设"刷新首条 system：
+      // 桌面端同一份内存 messages 会跨"切文件夹/切预设/恢复旧会话"复用，
+      // 核心 loop 只在缺 system 时补一条，因此这里（宿主层）负责把可能过期的
+      // 提示词更新成本轮目录与人设，避免"提示词写旧目录、工具在新目录执行"。
+      refreshSystemPrompt(messages, turnPreset, turnWorkspace);
+      const result = await runAgentTurnWithContinuations(messages, task, {
         cfg,
         workspace: turnWorkspace,
-        preset: opts?.preset ?? cfg.activePreset,    // composer 的预设 pill 可覆盖
+        preset: turnPreset,                        // composer 的预设 pill 可覆盖
         yolo: cfg.yolo,
+        // 单轮撞 cfg.maxSteps 后自动带上下文续跑，最多再 2 轮（约 3×maxSteps 步封顶），
+        // 避免"读了一堆文件还没动手就被步数上限硬停"。
+        maxContinuations: 2,
         onEvent: (evt) => broadcast(evt),
       });
       currentSessionFile = await saveSession(result.messages, currentSessionFile, turnWorkspace);
@@ -306,33 +328,61 @@ export function createAgentBridge(broadcast: Broadcast): void {
   }));
 
   /* ---------- 会话管理 ---------- */
-  ipcMain.handle('session:list', (_e, archiveFilter?: 'hide' | 'all' | 'only') => listSessions(50, archiveFilter));
-  ipcMain.handle('session:load', async (_e, file: string) => {
+  ipcMain.handle('session:list', (_e, archiveFilter?: unknown) => {
+    const filter = typeof archiveFilter === 'string' && ARCHIVE_FILTER_VALUES.has(archiveFilter)
+      ? (archiveFilter as 'hide' | 'all' | 'only')
+      : 'hide';
+    return listSessions(50, filter);
+  });
+  ipcMain.handle('session:load', async (_e, file: unknown) => {
+    if (typeof file !== 'string') return { ok: false, error: '非法的会话文件名' };
     // 任务跑着的时候绝不能切换当前会话：loop 持有的是旧的 messages 数组，
     // 这一轮结束时会把它的历史写进"刚加载的那个文件"，把别人的会话覆盖掉。
     if (running) return { ok: false, error: '任务执行中，无法切换会话' };
-    const loaded = await loadSession(file); // loadSession 内部已校验文件名与载荷
-    messages = loaded;
-    currentSessionFile = file; // 继续这个会话：后续轮次更新同一文件
-    // 返回渲染层可展示的历史（过滤掉 system 提示词，那是实现细节）
-    return { ok: true, messages: messages.filter((m) => m.role !== 'system') };
+    try {
+      const loaded = await loadSession(file); // loadSession 内部已校验文件名与载荷
+      // 恢复后首条 system 必须用"当前工作区/预设"刷新，否则模型会沿用上一会话的旧目录
+      // 与旧工具面（与 CLI 的 /resume 行为保持一致）。
+      const cfg = await loadConfig();
+      const ws = isDirectory(workspace) ? workspace : FALLBACK_WORKSPACE;
+      refreshSystemPrompt(loaded, cfg.activePreset, ws);
+      messages = loaded;
+      currentSessionFile = file; // 继续这个会话：后续轮次更新同一文件
+      // 返回渲染层可展示的历史（过滤掉 system 提示词，那是实现细节）
+      return { ok: true, messages: messages.filter((m) => m.role !== 'system') };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
   });
-  ipcMain.handle('session:archive', async (_e, file: string, archived: boolean) => {
-    await setSessionArchived(file, archived);
-    return { ok: true };
+  ipcMain.handle('session:archive', async (_e, file: unknown, archived: unknown) => {
+    if (typeof file !== 'string') return { ok: false, error: '非法的会话文件名' };
+    if (typeof archived !== 'boolean') return { ok: false, error: 'archived 必须是布尔值' };
+    try {
+      await setSessionArchived(file, archived);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
   });
 
   /* ---------- 配置（设置页） ---------- */
   ipcMain.handle('config:get', () => loadConfig());
-  ipcMain.handle('config:set', async (_e, partial: Partial<HarnessConfig>) => {
-    const cfg = { ...(await loadConfig()), ...partial };
+  ipcMain.handle('config:set', async (_e, partial: unknown) => {
+    const cleaned = sanitizeConfigPatch(partial);
+    if ('error' in cleaned) return { ok: false, error: cleaned.error };
+    const cfg = { ...(await loadConfig()), ...cleaned };
     await saveConfig(cfg);
     return { ok: true };
   });
   // 连接测试：按指定提供商（缺省当前激活的）发一个极小请求
-  ipcMain.handle('config:test', async (_e, providerId?: string) => {
+  ipcMain.handle('config:test', async (_e, providerId?: unknown) => {
     const cfg = await loadConfig();
-    const target = providerId ? { ...cfg, activeProviderId: providerId } : cfg;
+    const target = typeof providerId === 'string' && providerId
+      ? { ...cfg, activeProviderId: providerId }
+      : cfg;
+    if (providerId !== undefined && !(cfg.providers ?? []).some((p) => p.id === target.activeProviderId)) {
+      return { ok: false, message: '指定的提供商不存在' };
+    }
     try {
       await callChat(target, [
         { role: 'system', content: '你是连接测试器，只回复 pong' },
@@ -347,21 +397,25 @@ export function createAgentBridge(broadcast: Broadcast): void {
 
   /* ---------- 模型提供商（多提供商管理） ---------- */
   // 新增或更新（带 id 即更新）；成功后自动切为激活
-  ipcMain.handle('provider:save', async (_e, provider: ModelProvider) => {
+  ipcMain.handle('provider:save', async (_e, provider: unknown) => {
+    const clean = sanitizeProvider(provider);
+    if ('error' in clean) return { ok: false, message: clean.error };
+    const p = clean;
     const cfg = await loadConfig();
     const list = [...(cfg.providers ?? [])];
-    const idx = list.findIndex((p) => p.id === provider.id);
-    if (idx >= 0) list[idx] = provider; else list.push(provider);
+    const idx = list.findIndex((x) => x.id === p.id);
+    if (idx >= 0) list[idx] = p; else list.push(p);
     await saveConfig({
       ...cfg,
       providers: list,
       // 同步镜像字段，CLI 旧读取路径兼容
-      baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: provider.model,
-      activeProviderId: provider.id,
+      baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.model,
+      activeProviderId: p.id,
     });
-    return { ok: true, message: `已保存「${provider.name}」并设为当前` };
+    return { ok: true, message: `已保存「${p.name}」并设为当前` };
   });
-  ipcMain.handle('provider:delete', async (_e, id: string) => {
+  ipcMain.handle('provider:delete', async (_e, id: unknown) => {
+    if (typeof id !== 'string' || !id.trim()) return { ok: false, message: '非法的提供商 id' };
     const cfg = await loadConfig();
     const list = (cfg.providers ?? []).filter((p) => p.id !== id);
     if (list.length === 0) return { ok: false, message: '至少保留一个提供商' };
@@ -369,10 +423,14 @@ export function createAgentBridge(broadcast: Broadcast): void {
       ...cfg,
       providers: list,
       activeProviderId: cfg.activeProviderId === id ? list[0].id : cfg.activeProviderId,
+      ...(cfg.activeProviderId === id
+        ? { baseUrl: list[0].baseUrl, apiKey: list[0].apiKey, model: list[0].model }
+        : {}),
     });
     return { ok: true, message: '已删除' };
   });
-  ipcMain.handle('provider:set-active', async (_e, id: string) => {
+  ipcMain.handle('provider:set-active', async (_e, id: unknown) => {
+    if (typeof id !== 'string' || !id.trim()) return { ok: false, message: '非法的提供商 id' };
     const cfg = await loadConfig();
     const p = (cfg.providers ?? []).find((x) => x.id === id);
     if (!p) return { ok: false, message: '提供商不存在' };
@@ -380,9 +438,12 @@ export function createAgentBridge(broadcast: Broadcast): void {
     return { ok: true, message: `已切换到「${p.name}」` };
   });
   // 账号余额：DeepSeek 官方支持 GET /user/balance；其他厂商暂不支持
-  ipcMain.handle('provider:balance', async (_e, id: string) => {
+  ipcMain.handle('provider:balance', async (_e, id: unknown) => {
     const cfg = await loadConfig();
     const p = (cfg.providers ?? []).find((x) => x.id === id) ?? getActiveProvider(cfg);
+    if (typeof id === 'string' && id && !(cfg.providers ?? []).some((x) => x.id === id)) {
+      return { ok: false, message: '指定的提供商不存在' };
+    }
     if (!p.baseUrl.includes('deepseek')) {
       return { ok: false, message: '该提供商暂不支持余额查询（目前仅 DeepSeek）' };
     }
@@ -405,9 +466,11 @@ export function createAgentBridge(broadcast: Broadcast): void {
   });
 
   /* ---------- Agent 预设与工作区 ---------- */
-  ipcMain.handle('preset:set', async (_e, preset: AgentPreset) => {
+  ipcMain.handle('preset:set', async (_e, preset: unknown) => {
+    const p = asPreset(preset);
+    if (!p) return { ok: false, message: '非法的预设（可选 standard/minimal/creative）' };
     const cfg = await loadConfig();
-    await saveConfig({ ...cfg, activePreset: preset });
+    await saveConfig({ ...cfg, activePreset: p });
     return { ok: true, message: '预设已切换（对新任务生效）' };
   });
 
@@ -436,9 +499,10 @@ export function createAgentBridge(broadcast: Broadcast): void {
   });
 
   /** 从侧栏列表 /"最近使用"里切换（或渲染层直接给一个路径） */
-  ipcMain.handle('workspace:set', async (_e, path: string) => {
-    if (!isDirectory(path)) return { ok: false, message: `文件夹不存在：${path}` };
-    return applyWorkspace(path);
+  ipcMain.handle('workspace:set', async (_e, input: unknown) => {
+    if (typeof input !== 'string' || !input.trim()) return { ok: false, message: '非法的文件夹路径' };
+    if (!isDirectory(input)) return { ok: false, message: `文件夹不存在：${input}` };
+    return applyWorkspace(input);
   });
 
   /** 在访达中打开当前工作区（openPath 的错误字符串不能吞掉，否则按钮像没反应） */
@@ -459,7 +523,7 @@ export function createAgentBridge(broadcast: Broadcast): void {
     try {
       const url = new URL(request.url);
       const rel = url.pathname.split('/').map(decodeURIComponent).join('/').replace(/^\/+/, '');
-      const abs = safeWorkspacePath(rel);
+      const abs = await safeWorkspacePath(rel);
       const data = await fs.promises.readFile(abs);
       return new Response(new Uint8Array(data), {
         headers: {
@@ -467,8 +531,14 @@ export function createAgentBridge(broadcast: Broadcast): void {
           // 预览的 HTML 能跑脚本（否则小游戏/交互页面没法用），但必须掐死"外联"：
           // 没有这条 CSP 时，被预览的页面可以 fetch 工作区里的其它文件
           // （同一 nh-file:// 来源，同源请求会成功）再把内容 POST 到外部服务器。
+          //
+          // script-src/style-src 必须带 'self'：README 承诺"相对路径引用的 CSS/JS
+          // 也能顺着同一协议取到"，只给 unsafe-inline 会把同目录的 app.js / style.css
+          // 一并拦掉（多文件预览整体白屏）。'self' 精确指向 nh-file:// 这个
+          // 工作区受限来源，不放开任何外部站点；connect-src 'none' 依旧封死 fetch/XHR。
           'content-security-policy':
-            "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; " +
+            "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+            "style-src 'self' 'unsafe-inline'; " +
             "img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; " +
             "connect-src 'none'; form-action 'none'; base-uri 'none'",
         },
@@ -481,9 +551,12 @@ export function createAgentBridge(broadcast: Broadcast): void {
     }
   });
 
+  /** 规范化文件相对路径入参：非字符串一律按根目录处理，绝不让 undefined 穿透到路径解析 */
+  const asRel = (rel: unknown): string => (typeof rel === 'string' && rel ? rel : '.');
+
   /** 列出工作区内某个目录（目录在前、按名字排序；跳过隐藏文件与 node_modules） */
-  ipcMain.handle('file:list', async (_e, rel?: string) => {
-    const abs = safeWorkspacePath(rel);
+  ipcMain.handle('file:list', async (_e, rel?: unknown) => {
+    const abs = await safeWorkspacePath(asRel(rel));
     const root = path.resolve(workspace);
     const dirs = await fs.promises.readdir(abs, { withFileTypes: true });
     const entries = await Promise.all(dirs
@@ -521,10 +594,10 @@ export function createAgentBridge(broadcast: Broadcast): void {
    * 读一个文件交给界面渲染。HTML/图片转成 data: URL（用 iframe/img 直接显示），
    * 文本类返回纯文本（markdown 在界面里渲染成排版，代码用等宽字体展示）。
    */
-  ipcMain.handle('file:preview', async (_e, rel: string) => {
+  ipcMain.handle('file:preview', async (_e, rel: unknown) => {
     let abs: string;
     try {
-      abs = safeWorkspacePath(rel);
+      abs = await safeWorkspacePath(asRel(rel));
     } catch (err) {
       return { ok: false, message: (err as Error).message };
     }
@@ -563,9 +636,9 @@ export function createAgentBridge(broadcast: Broadcast): void {
   });
 
   /** 在访达里定位文件 */
-  ipcMain.handle('file:reveal', (_e, rel: string) => {
+  ipcMain.handle('file:reveal', async (_e, rel: unknown) => {
     try {
-      shell.showItemInFolder(safeWorkspacePath(rel));
+      shell.showItemInFolder(await safeWorkspacePath(asRel(rel)));
       return { ok: true };
     } catch (err) {
       return { ok: false, message: (err as Error).message };
@@ -573,9 +646,13 @@ export function createAgentBridge(broadcast: Broadcast): void {
   });
 
   /** 交给系统默认应用（HTML 就是默认浏览器）打开 */
-  ipcMain.handle('file:openExternal', async (_e, rel: string) => {
-    const msg = await shell.openPath(safeWorkspacePath(rel));
-    return { ok: !msg, message: msg };
+  ipcMain.handle('file:openExternal', async (_e, rel: unknown) => {
+    try {
+      const msg = await shell.openPath(await safeWorkspacePath(asRel(rel)));
+      return { ok: !msg, message: msg };
+    } catch (err) {
+      return { ok: false, message: (err as Error).message };
+    }
   });
 
   /* ---------- 工具与插件（插件市场页） ---------- */
@@ -585,7 +662,8 @@ export function createAgentBridge(broadcast: Broadcast): void {
 
   ipcMain.handle('plugin:installed', async () => listInstalled(await loadConfig()));
   ipcMain.handle('marketplace:list', () => fetchMarketplace());
-  ipcMain.handle('plugin:install', async (_e, name: string) => {
+  ipcMain.handle('plugin:install', async (_e, name: unknown) => {
+    if (typeof name !== 'string' || !name.trim()) return { ok: false, message: '非法的插件名' };
     const index = await fetchMarketplace();
     const entry = index.plugins.find((p) => p.name === name);
     if (!entry) return { ok: false, message: `市场里没有叫 ${name} 的插件` };
@@ -594,7 +672,9 @@ export function createAgentBridge(broadcast: Broadcast): void {
     return result;
   });
   // 启用/禁用开关：实时生效（注册/注销工具）+ 状态写入配置持久化
-  ipcMain.handle('plugin:toggle', async (_e, name: string, enabled: boolean) => {
+  ipcMain.handle('plugin:toggle', async (_e, name: unknown, enabled: unknown) => {
+    if (typeof name !== 'string' || !name.trim()) return { ok: false, message: '非法的插件名' };
+    if (typeof enabled !== 'boolean') return { ok: false, message: 'enabled 必须是布尔值' };
     const cfg = await loadConfig();
     const result = await setPluginEnabled(name, enabled, cfg);
     if (result.ok) {
@@ -602,9 +682,14 @@ export function createAgentBridge(broadcast: Broadcast): void {
     }
     return result;
   });
-  ipcMain.handle('plugin:uninstall', async (_e, name: string) => {
-    await uninstallPlugin(name);
-    return { ok: true, message: `已卸载 ${name}` };
+  ipcMain.handle('plugin:uninstall', async (_e, name: unknown) => {
+    if (typeof name !== 'string' || !name.trim()) return { ok: false, message: '非法的插件名' };
+    try {
+      await uninstallPlugin(name);
+      return { ok: true, message: `已卸载 ${name}` };
+    } catch (err) {
+      return { ok: false, message: (err as Error).message };
+    }
   });
   // 在 Finder 里打开插件目录（"添加插件"手动安装入口）
   ipcMain.handle('plugin:reveal', async () => {

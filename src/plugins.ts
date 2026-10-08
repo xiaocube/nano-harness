@@ -122,12 +122,36 @@ async function importPluginTools(dir: string, manifest: PluginManifest): Promise
   if (!Array.isArray(tools)) {
     throw new Error('插件模块必须导出 tools 数组（命名导出或默认导出均可）');
   }
-  // 形状校验：像 Tool 的才收——防御插件写错导致 harness 崩溃
-  return (tools as Tool[])
-    .filter((t) => typeof t?.name === 'string' && typeof t?.execute === 'function')
-    // describe 缺失时补一个：loop 会调用它生成摘要，缺了会抛异常并把
-    // 未闭合的 tool_calls 留在历史里（协议非法，之后每次请求都 400）。
-    .map((t) => ({ ...t, describe: typeof t.describe === 'function' ? t.describe : () => t.name }));
+  // 形状校验：
+  //   - name/execute/description 必须合规（坏工具会让每次模型请求 400，拖垮整个 harness）；
+  //   - 工具名必须匹配 OpenAI function calling 允许的字符集；
+  //   - describe 缺失时补一个：loop 会调用它生成摘要，缺了会抛异常并把
+  //     未闭合的 tool_calls 留在历史里（协议非法，之后每次请求都 400）。
+  const valid: Tool[] = [];
+  const rejected: string[] = [];
+  for (const raw of tools) {
+    const t = raw as Partial<Tool> | null;
+    if (!t || typeof t !== 'object') { rejected.push(String(t)); continue; }
+    if (typeof t.name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$/.test(t.name) || t.name.includes('..')) {
+      rejected.push(typeof t.name === 'string' ? t.name : '(无名)');
+      continue;
+    }
+    if (typeof t.execute !== 'function' || typeof t.description !== 'string') {
+      rejected.push(t.name);
+      continue;
+    }
+    valid.push({
+      ...(t as Tool),
+      // 缺 parameters 时给空 schema：OpenAI 协议要求该字段存在，undefined 会让端点 400
+      parameters: (t.parameters && typeof t.parameters === 'object' ? t.parameters : { type: 'object', properties: {} }) as Tool['parameters'],
+      needsPermission: t.needsPermission !== false, // 没显式声明为 false 时，按危险工具处理（默认安全）
+      describe: typeof t.describe === 'function' ? t.describe : () => t.name as string,
+    });
+  }
+  if (valid.length === 0) {
+    throw new Error(`插件没有提供任何合法工具（被拒绝的工具：${rejected.join(', ') || '空数组'}）。工具名须以字母或数字开头，只能含字母、数字、点、下划线、连字符，且不超过 64 个字符`);
+  }
+  return valid;
 }
 
 /** 读取插件目录（不注册），返回清单 + 工具名 + 启用状态 */
@@ -253,17 +277,35 @@ export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: b
   let extractTo: string | null = null;
   try {
     if (entry.source.type === 'bundled') {
-      // 内置示例：直接复制（Node 没有内置 cp -r，手动递归）
-      const src = resourcePath(entry.source.dir);
+      // 内置示例：直接复制。dir 来自市场索引，仍禁止绝对路径与 ".."，避免越界复制
+      const dir = entry.source.dir;
+      if (path.isAbsolute(dir) || dir.split(/[\\/]+/).includes('..')) {
+        return { ok: false, message: `非法的内置插件路径：${dir}` };
+      }
+      const src = resourcePath(dir);
       await copyDir(src, dest);
       return { ok: true, message: `已安装内置插件 ${entry.name}` };
     }
 
     // github 来源：走 api.github.com 的 tarball 接口（对国内网络友好）
     const { repo, subdir } = entry.source;
+    // 仓库名来自市场索引，仍校验形状：防止奇怪的路径段/查询串把请求带到非预期端点
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+      return { ok: false, message: `非法的 GitHub 仓库标识：${repo}` };
+    }
+    if (subdir !== undefined) {
+      // 与 bundled 来源同一套路径守卫：旧正则 [\w./-]+ 会放行 ".." 段，
+      // subdir = "../../.." 能让后面的 path.join 逃出解压临时目录（Zip Slip 的同类问题），
+      // 进而把工作区外任意含 plugin.json 的目录拷进插件目录。
+      if (path.isAbsolute(subdir) || subdir.split(/[\\/]+/).includes('..') || !/^[\w./-]+$/.test(subdir)) {
+        return { ok: false, message: `非法的插件子目录：${subdir}` };
+      }
+    }
     const res = await fetch(`https://api.github.com/repos/${repo}/tarball`, {
       signal: AbortSignal.timeout(60_000),
       redirect: 'follow',
+      // GitHub API 强制要求 User-Agent，缺失会直接回 403，表现为"所有插件都装不上"
+      headers: { 'User-Agent': 'nano-harness-plugin-installer', Accept: 'application/vnd.github+json' },
     });
     if (!res.ok) return { ok: false, message: `下载失败：HTTP ${res.status}` };
     tarball = path.join(os.tmpdir(), `nano-plugin-${name}-${Date.now()}.tar.gz`);
@@ -272,8 +314,21 @@ export async function installFromEntry(entry: MarketplaceEntry): Promise<{ ok: b
     // 解压到临时目录，再从里面把插件子目录拷出来
     extractTo = path.join(os.tmpdir(), `nano-plugin-${name}-${Date.now()}`);
     await fs.mkdir(extractTo, { recursive: true });
+    // 安全：先只列条目名，拒绝绝对路径与 "../" 穿越（Zip Slip），再真正解压。
     // execFile 直接 execve，不经过 shell：名字里的 $(...) / 反引号无法再被解释
-    await execTar(['-xzf', tarball, '-C', extractTo]);
+    const listing = await execTarCapture(['-tzf', tarball]);
+    for (const member of listing.split('\n').map((l) => l.trim()).filter(Boolean)) {
+      const normalized = member.replace(/\\/g, '/');
+      if (path.posix.isAbsolute(normalized) || normalized.split('/').includes('..')) {
+        return { ok: false, message: `压缩包包含不安全的路径条目，已拒绝安装：${member}` };
+      }
+    }
+    try {
+      await execTar(['-xzf', tarball, '-C', extractTo, '--no-same-owner']);
+    } catch {
+      // 个别系统的 tar 不认长参数，退回最基础的解压（前面已做条目安全检查）
+      await execTar(['-xzf', tarball, '-C', extractTo]);
+    }
     const root = (await fs.readdir(extractTo))[0];
     if (!root) return { ok: false, message: '压缩包为空' };
     const pluginDir = path.join(extractTo, root, subdir ?? '');
@@ -305,14 +360,19 @@ export async function fetchMarketplace(): Promise<MarketplaceIndex> {
 
 /* ---------------- 内部工具函数 ---------------- */
 
-/** 递归复制目录（Node 内置 fs 没有 cp -r 的承诺版封装，手写一个） */
+/**
+ * 递归复制目录（Node 内置 fs 没有 cp -r 的承诺版封装，手写一个）。
+ * 安全：源目录里的符号链接一律跳过，不跟随——解压来的第三方插件若带
+ * `link -> /etc` 之类的条目，跟随复制会把工作区外的内容带进插件目录。
+ */
 async function copyDir(src: string, dest: string): Promise<void> {
   await fs.mkdir(dest, { recursive: true });
   for (const entry of await fs.readdir(src, { withFileTypes: true })) {
     const s = path.join(src, entry.name);
     const d = path.join(dest, entry.name);
+    if (entry.isSymbolicLink()) continue; // 不复制任何符号链接
     if (entry.isDirectory()) await copyDir(s, d);
-    else await fs.copyFile(s, d);
+    else if (entry.isFile()) await fs.copyFile(s, d);
   }
 }
 
@@ -320,6 +380,15 @@ async function copyDir(src: string, dest: string): Promise<void> {
 function execTar(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     execFileCb('tar', args, { timeout: 60_000 }, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+/** 调用系统 tar 并取回 stdout（用于解压前列出条目做安全检查） */
+function execTarCapture(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFileCb('tar', args, { timeout: 60_000, maxBuffer: 10_000_000 }, (err, stdout) =>
+      err ? reject(err) : resolve(stdout),
+    );
   });
 }
 

@@ -141,3 +141,61 @@ describe('session: 脏数据免疫', () => {
     await assert.rejects(() => loadSession('does-not-exist.json'));
   });
 });
+
+describe('session: 工具调用组清洗（协议合法性）', () => {
+  test('assistant 声明了 tool_calls 却没有 tool 结果 → 剥掉悬空调用', async () => {
+    const file = await saveSession([
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: '写文件' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'orphan-1', type: 'function', function: { name: 'write_file', arguments: '{}' } }],
+      },
+      // 注意：缺少 role:'tool' 回应 orphan-1（写入中断 / 手工编辑会造成这种历史）
+    ], undefined, '/p');
+    const loaded = await loadSession(file);
+    const assistant = loaded.find((m) => m.role === 'assistant');
+    assert.ok(assistant, 'assistant 消息应保留');
+    assert.equal(assistant.tool_calls, undefined, '无人应答的 tool_calls 必须被剥掉，否则端点稳定 400');
+    assert.ok(!loaded.some((m) => m.role === 'tool'));
+  });
+
+  test('有 tool 结果对应的 tool_calls 原样保留', async () => {
+    const file = await saveSession([
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: '读文件' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: 'file-body' },
+    ], undefined, '/p');
+    const loaded = await loadSession(file);
+    const assistant = loaded.find((m) => m.role === 'assistant');
+    assert.ok(assistant.tool_calls, '有结果回应的调用组必须保留');
+    assert.equal(assistant.tool_calls[0].id, 'c1');
+  });
+
+  test('部分应答：只留有结果的那个 call，丢弃无应答的', async () => {
+    const file = await saveSession([
+      { role: 'system', content: 'sys' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 'ok1', type: 'function', function: { name: 'read_file', arguments: '{}' } },
+          { id: 'dangling', type: 'function', function: { name: 'write_file', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'ok1', content: 'body' },
+      { role: 'tool', tool_call_id: 'ghost', content: '指向不存在的 call，应被丢弃' },
+    ], undefined, '/p');
+    const loaded = await loadSession(file);
+    const assistant = loaded.find((m) => m.role === 'assistant');
+    assert.deepEqual(assistant.tool_calls?.map((c) => c.id), ['ok1'], '只保留有应答的 ok1');
+    assert.deepEqual(loaded.filter((m) => m.role === 'tool').map((m) => m.tool_call_id), ['ok1'],
+      '指向不存在 call 的孤儿 tool 必须被丢弃');
+  });
+});
